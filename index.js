@@ -1,72 +1,111 @@
 /**
- * Greenbug Energy
- * GHL -> wait -> Twilio outbound call -> ElevenLabs cloned voice (Nicola)
+ * Greenbug Energy - Outbound AI Caller (Nicola)
+ * - GHL webhook triggers outbound call
+ * - Twilio voice webhooks serve TwiML with <Play> to ElevenLabs TTS endpoint
+ * - Conversational loop: Twilio speech -> OpenAI -> next prompt -> repeat
+ *
+ * Required env vars:
+ *  PUBLIC_BASE_URL          = https://twilio-railway-webhook-production.up.railway.app
+ *  TWILIO_ACCOUNT_SID       = ACxxxx
+ *  TWILIO_AUTH_TOKEN        = xxxxx
+ *  TWILIO_FROM_NUMBER       = +44....
+ *  OPENAI_API_KEY           = sk-...
+ *  ELEVENLABS_API_KEY       = xxxxx
+ *  ELEVENLABS_VOICE_ID      = Flx6Swjd7o5h8giaG5Qk
+ *
+ * Optional:
+ *  AGENT_NAME               = Nicola
+ *  COMPANY_NAME             = Greenbug Energy
+ *  MAX_TURNS                = 8
+ *  RESULT_WEBHOOK_URL       = (optional) send outcome to your CRM/GHL webhook
  */
 
 const express = require("express");
 const twilio = require("twilio");
 
 const app = express();
-
-// GHL sends JSON, Twilio sends form-encoded
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-/* =======================
-   CONFIG / HELPERS
-======================= */
+// ------------------ Config ------------------
+const {
+  PUBLIC_BASE_URL,
+  TWILIO_ACCOUNT_SID,
+  TWILIO_AUTH_TOKEN,
+  TWILIO_FROM_NUMBER,
+  OPENAI_API_KEY,
+  ELEVENLABS_API_KEY,
+  ELEVENLABS_VOICE_ID,
+  RESULT_WEBHOOK_URL,
+} = process.env;
 
-function requireEnv(name) {
-  const v = process.env[name];
-  if (!v) throw new Error(`Missing env var: ${name}`);
-  return v;
-}
+const AGENT_NAME = process.env.AGENT_NAME || "Nicola";
+const COMPANY_NAME = process.env.COMPANY_NAME || "Greenbug Energy";
+const MAX_TURNS = parseInt(process.env.MAX_TURNS || "8", 10);
 
-function baseUrl() {
-  return requireEnv("PUBLIC_BASE_URL").replace(/\/+$/, "");
-}
+// Simple in-memory state per call (fine to start; later move to Redis/DB)
+const callState = new Map(); // CallSid -> { turns, history: [{role,content}], leadName, leadPhone }
 
-function xmlEscape(str) {
-  return String(str || "")
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
+// ------------------ Health ------------------
+app.get("/", (req, res) => res.status(200).send("OK - Greenbug Energy outbound caller running"));
+app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-function cleanText(str, max = 700) {
-  return String(str || "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, max);
-}
+// ------------------ ElevenLabs TTS ------------------
+// Example: /tts?text=Hello+there
+app.get("/tts", async (req, res) => {
+  try {
+    const text = (req.query.text || "").toString();
+    if (!text) return res.status(400).send("Missing text");
+    if (!ELEVENLABS_API_KEY) return res.status(500).send("Missing ELEVENLABS_API_KEY");
+    if (!ELEVENLABS_VOICE_ID) return res.status(500).send("Missing ELEVENLABS_VOICE_ID");
 
-function normalizeE164(phone) {
-  if (!phone) return "";
-  return String(phone).replace(/[^\d+]/g, "");
-}
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(
+      ELEVENLABS_VOICE_ID
+    )}/stream`;
 
-/* =======================
-   HEALTH
-======================= */
+    // Keep it short-ish per request (Twilio likes fast responses)
+    const payload = {
+      text,
+      model_id: "eleven_monolingual_v1",
+      voice_settings: {
+        stability: 0.55,
+        similarity_boost: 0.8,
+        style: 0.25,
+        use_speaker_boost: true
+      }
+    };
 
-app.get("/", (req, res) => {
-  res.send("OK – Greenbug Energy outbound caller running");
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        "Accept": "audio/mpeg",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    if (!r.ok) {
+      const errText = await r.text();
+      console.error("ElevenLabs error:", r.status, errText);
+      return res.status(500).send("TTS failed");
+    }
+
+    res.setHeader("Content-Type", "audio/mpeg");
+    // Stream audio back to Twilio
+    r.body.pipe(res);
+  } catch (e) {
+    console.error("TTS exception:", e);
+    res.status(500).send("TTS exception");
+  }
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-/* =======================
-   GHL → TRIGGER OUTBOUND CALL
-======================= */
-
+// ------------------ GHL webhook -> trigger outbound call ------------------
 app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
+    // try common GHL payload paths
     const phoneRaw =
       body.phone ||
       body.Phone ||
@@ -74,185 +113,293 @@ app.post("/ghl/lead", async (req, res) => {
       body.contact?.phoneNumber ||
       body.contact?.phone_number;
 
-    const name =
+    const leadName =
       body.name ||
       body.full_name ||
-      body.contact?.firstName ||
+      body.fullName ||
       body.contact?.name ||
+      body.contact?.firstName ||
+      body.contact?.first_name ||
       "there";
 
-    const to = normalizeE164(phoneRaw);
-    if (!to.startsWith("+")) {
-      return res.status(400).json({
-        ok: false,
-        error: "Phone must be E.164 format (+44...)",
-        got: phoneRaw,
-      });
+    if (!phoneRaw) return res.status(400).json({ ok: false, error: "Missing phone in payload" });
+
+    if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
+      return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
+    }
+    if (!PUBLIC_BASE_URL) {
+      return res.status(500).json({ ok: false, error: "Missing PUBLIC_BASE_URL" });
     }
 
-    const client = twilio(
-      requireEnv("TWILIO_ACCOUNT_SID"),
-      requireEnv("TWILIO_AUTH_TOKEN")
-    );
+    const to = String(phoneRaw).trim();
+    const from = TWILIO_FROM_NUMBER;
+
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
 
     const call = await client.calls.create({
       to,
-      from: requireEnv("TWILIO_FROM_NUMBER"),
-      url: `${baseUrl()}/twilio/voice?name=${encodeURIComponent(name)}`,
+      from,
+      url: `${PUBLIC_BASE_URL}/twilio/voice?leadName=${encodeURIComponent(leadName)}&leadPhone=${encodeURIComponent(to)}`,
       method: "POST",
-      statusCallback: `${baseUrl()}/twilio/status`,
-      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
+      statusCallback: `${PUBLIC_BASE_URL}/twilio/status`,
       statusCallbackMethod: "POST",
+      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"],
     });
 
-    res.json({
-      ok: true,
-      message: "Call triggered",
-      sid: call.sid,
-    });
-  } catch (err) {
-    console.error("GHL ERROR:", err);
-    res.status(500).json({ ok: false, error: err.message });
+    return res.status(200).json({ ok: true, message: "Call triggered", sid: call.sid, to, leadName });
+  } catch (e) {
+    console.error("Error in /ghl/lead:", e);
+    return res.status(500).json({ ok: false, error: e.message || "Unknown error" });
   }
 });
 
-/* =======================
-   TWILIO – CALL SCRIPT
-======================= */
-
+// ------------------ Twilio: start of call ------------------
 app.post("/twilio/voice", (req, res) => {
-  const leadName = cleanText(req.query.name || "there", 50);
-  const agent = process.env.AGENT_NAME || "Nicola";
-  const b = baseUrl();
+  const leadName = (req.query.leadName || "there").toString();
+  const leadPhone = (req.query.leadPhone || "").toString();
+  const callSid = (req.body.CallSid || req.query.CallSid || "").toString();
 
-  const intro = `Hi ${leadName}, I’m ${agent} from Greenbug Energy. You recently requested a callback about a site survey.`;
-  const question =
-    `If now’s a good time, just say book a survey. Otherwise, say call me later.`;
+  // init state
+  if (!callState.has(callSid)) {
+    callState.set(callSid, {
+      turns: 0,
+      leadName,
+      leadPhone,
+      history: [
+        {
+          role: "system",
+          content:
+            `You are ${AGENT_NAME}, a friendly human-sounding phone agent for ${COMPANY_NAME} in the UK. ` +
+            `You are calling a lead who just submitted a form requesting a callback about a site survey. ` +
+            `Your job: qualify briefly, answer questions, and book a site survey. ` +
+            `Keep it natural, concise, and conversational. No robotic phrasing. ` +
+            `If the lead wants later, agree and ask for best time. ` +
+            `If they agree to book, collect postcode and preferred day/time window. ` +
+            `Never mention you are AI.`
+        }
+      ],
+    });
+  }
+
+  // First spoken line from Nicola
+  const firstLine =
+    `Hi ${leadName}, it’s ${AGENT_NAME} calling from ${COMPANY_NAME}. ` +
+    `You’ve just asked us to call you back about a site survey. ` +
+    `Have I caught you at an okay time for a quick minute?`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${xmlEscape(`${b}/tts?text=${encodeURIComponent(intro)}`)}</Play>
-  <Play>${xmlEscape(`${b}/tts?text=${encodeURIComponent(question)}`)}</Play>
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(firstLine)}</Play>
 
-  <Gather
-    input="speech"
-    action="${xmlEscape(`${b}/twilio/speech`)}"
-    method="POST"
-    timeout="6"
-    speechTimeout="auto"
-  />
-
-  <Play>${xmlEscape(`${b}/tts?text=${encodeURIComponent(
-    "No problem at all. We’ll send you a text so you can rebook at a better time. Bye for now."
-  )}`)}</Play>
+  <Gather input="speech" action="/twilio/turn?CallSid=${encodeURIComponent(callSid)}" method="POST" speechTimeout="auto" />
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("Sorry, I didn’t catch that. I’ll send a quick text so you can pick a time. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-/* =======================
-   TWILIO – SPEECH RESULT
-======================= */
+// ------------------ Twilio: each conversational turn ------------------
+app.post("/twilio/turn", async (req, res) => {
+  const callSid = (req.query.CallSid || req.body.CallSid || "").toString();
+  const speech = (req.body.SpeechResult || "").toString().trim();
+  const confidence = req.body.Confidence;
 
-app.post("/twilio/speech", (req, res) => {
-  const speech = cleanText((req.body.SpeechResult || "").toLowerCase(), 300);
-  const b = baseUrl();
+  const state = callState.get(callSid) || { turns: 0, history: [] };
+  state.turns = (state.turns || 0) + 1;
 
-  let reply =
-    "Thanks so much. We’ll be in touch shortly. Bye for now.";
+  console.log("TURN", { callSid, turn: state.turns, speech, confidence });
 
-  if (speech.includes("later") || speech.includes("busy")) {
-    reply = "No problem at all. We’ll give you a call later. Bye for now.";
+  // if silence / nothing
+  if (!speech) {
+    const msg = "No worries — I’ll text you a link to choose a time. Bye for now.";
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(msg));
   }
 
-  if (speech.includes("book") || speech.includes("survey")) {
-    reply =
-      "Perfect. We’ll get your site survey booked in and text you the details shortly. Bye for now.";
+  // hard stop if too many turns
+  if (state.turns >= MAX_TURNS) {
+    const msg = "Thanks — I don’t want to keep you. I’ll text you the next steps. Bye for now.";
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(msg));
   }
 
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${xmlEscape(`${b}/tts?text=${encodeURIComponent(reply)}`)}</Play>
-  <Hangup/>
-</Response>`;
+  // Add user speech to history
+  state.history.push({ role: "user", content: speech });
 
-  res.type("text/xml").send(twiml);
-});
-
-/* =======================
-   TWILIO – STATUS CALLBACK
-======================= */
-
-app.post("/twilio/status", (req, res) => {
-  console.log("CALL STATUS:", {
-    sid: req.body.CallSid,
-    status: req.body.CallStatus,
-    to: req.body.To,
-    duration: req.body.CallDuration,
-  });
-  res.send("ok");
-});
-
-/* =======================
-   ELEVENLABS TTS ENDPOINT
-======================= */
-
-app.get("/tts", async (req, res) => {
+  // Ask OpenAI for the next line + action tag
+  let ai;
   try {
-    const text = cleanText(req.query.text, 700);
-    if (!text) return res.status(400).send("Missing text");
-
-    const response = await fetch(
-      `https://api.elevenlabs.io/v1/text-to-speech/${requireEnv(
-        "ELEVENLABS_VOICE_ID"
-      )}/stream`,
-      {
-        method: "POST",
-        headers: {
-          "xi-api-key": requireEnv("ELEVENLABS_API_KEY"),
-          "Content-Type": "application/json",
-          Accept: "audio/mpeg",
-        },
-        body: JSON.stringify({
-          text,
-          voice_settings: {
-            stability: 0.45,
-            similarity_boost: 0.85,
-            style: 0.3,
-            use_speaker_boost: true,
-          },
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const err = await response.text();
-      console.error("ELEVENLABS ERROR:", err);
-      return res.status(502).send("TTS failed");
-    }
-
-    res.setHeader("Content-Type", "audio/mpeg");
-    res.setHeader("Cache-Control", "no-store");
-
-    const reader = response.body.getReader();
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      res.write(Buffer.from(value));
-    }
-    res.end();
-  } catch (err) {
-    console.error("TTS ERROR:", err);
-    res.status(500).send("TTS error");
+    ai = await getNextFromOpenAI(state.history);
+  } catch (e) {
+    console.error("OpenAI error:", e);
+    const msg = "Sorry — I’m having a quick technical issue. I’ll text you shortly to arrange the survey. Bye for now.";
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(msg));
   }
+
+  const { reply, action } = ai;
+  state.history.push({ role: "assistant", content: reply });
+  callState.set(callSid, state);
+
+  // If booking confirmed, we can send outcome webhook (stub) + end
+  if (action === "BOOK") {
+    await sendResultWebhookSafe({
+      callSid,
+      outcome: "BOOK",
+      leadName: state.leadName,
+      leadPhone: state.leadPhone,
+      lastUserUtterance: speech,
+      agentReply: reply,
+      transcript: compactTranscript(state.history),
+    });
+
+    const closing = reply + " Thanks — I’ll get that booked and text you the details. Bye for now.";
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(closing));
+  }
+
+  if (action === "CALLBACK") {
+    await sendResultWebhookSafe({
+      callSid,
+      outcome: "CALLBACK",
+      leadName: state.leadName,
+      leadPhone: state.leadPhone,
+      lastUserUtterance: speech,
+      agentReply: reply,
+      transcript: compactTranscript(state.history),
+    });
+
+    const closing = reply + " No problem — I’ll arrange a callback. Bye for now.";
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(closing));
+  }
+
+  if (action === "END") {
+    await sendResultWebhookSafe({
+      callSid,
+      outcome: "END",
+      leadName: state.leadName,
+      leadPhone: state.leadPhone,
+      lastUserUtterance: speech,
+      agentReply: reply,
+      transcript: compactTranscript(state.history),
+    });
+
+    return res.type("text/xml").send(makeTwiMLPlayAndHangup(reply));
+  }
+
+  // Default: continue conversation
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(reply)}</Play>
+  <Gather input="speech" action="/twilio/turn?CallSid=${encodeURIComponent(callSid)}" method="POST" speechTimeout="auto" />
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("Sorry, I didn’t catch that. I’ll text you a link to pick a time. Bye for now.")}</Play>
+  <Hangup/>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
 });
 
-/* =======================
-   START SERVER
-======================= */
+// ------------------ Twilio call status callback ------------------
+app.post("/twilio/status", (req, res) => {
+  const payload = {
+    CallSid: req.body.CallSid,
+    CallStatus: req.body.CallStatus,
+    To: req.body.To,
+    From: req.body.From,
+    Duration: req.body.CallDuration,
+    Timestamp: req.body.Timestamp,
+  };
+  console.log("Call status:", payload);
 
+  // Cleanup memory when completed
+  if (payload.CallStatus === "completed") {
+    callState.delete(payload.CallSid);
+  }
+
+  res.status(200).send("ok");
+});
+
+// ------------------ OpenAI helper ------------------
+async function getNextFromOpenAI(history) {
+  if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  // We request a strict tiny JSON back so it's predictable.
+  const prompt = [
+    ...history,
+    {
+      role: "system",
+      content:
+        `Return ONLY valid JSON: {"reply":"...","action":"CONTINUE|BOOK|CALLBACK|END"}. ` +
+        `- BOOK only when the lead clearly agrees to book and you have at least postcode + a day/time window OR you are ready to confirm next step.\n` +
+        `- CALLBACK if they ask to be called later and give a time/day preference.\n` +
+        `- END if they are not interested / wrong number / hostile.\n` +
+        `Reply must be natural UK phone style, short, friendly, human.\n`
+    }
+  ];
+
+  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.5,
+      messages: prompt,
+    }),
+  });
+
+  if (!r.ok) {
+    const txt = await r.text();
+    throw new Error(`OpenAI HTTP ${r.status}: ${txt}`);
+  }
+
+  const data = await r.json();
+  const content = data?.choices?.[0]?.message?.content || "";
+
+  // Parse JSON safely
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch {
+    // fallback if model misbehaves
+    parsed = { reply: content.slice(0, 220), action: "CONTINUE" };
+  }
+
+  const reply = (parsed.reply || "").toString().trim() || "Okay — tell me a bit more about that.";
+  const actionRaw = (parsed.action || "CONTINUE").toString().toUpperCase();
+  const action = ["CONTINUE", "BOOK", "CALLBACK", "END"].includes(actionRaw) ? actionRaw : "CONTINUE";
+
+  return { reply, action };
+}
+
+// ------------------ Result webhook (optional) ------------------
+async function sendResultWebhookSafe(payload) {
+  try {
+    if (!RESULT_WEBHOOK_URL) return;
+    await fetch(RESULT_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    console.error("Result webhook failed:", e);
+  }
+}
+
+function compactTranscript(history) {
+  return history
+    .filter(m => m.role === "user" || m.role === "assistant")
+    .map(m => `${m.role === "user" ? "Lead" : AGENT_NAME}: ${m.content}`)
+    .join("\n");
+}
+
+function makeTwiMLPlayAndHangup(text) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(text)}</Play>
+  <Hangup/>
+</Response>`;
+}
+
+// IMPORTANT: Railway port
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () =>
-  console.log(`Greenbug Energy caller listening on ${PORT}`)
-);
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
