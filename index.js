@@ -2,27 +2,25 @@ const express = require("express");
 
 const app = express();
 
-// Twilio sends webhooks as x-www-form-urlencoded by default:
+// Twilio sends form-encoded by default, so handle both:
 app.use(express.urlencoded({ extended: false }));
+app.use(express.json());
 
-// Health check
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
 
-// Twilio Voice webhook
+// Twilio Voice Webhook (POST)
 app.post("/twilio/voice", (req, res) => {
-  // Return TwiML (XML) that speaks then hangs up
-  res.type("text/xml");
-  res.send(`<?xml version="1.0" encoding="UTF-8"?>
+  // Return TwiML
+  res
+    .status(200)
+    .type("text/xml")
+    .send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="en-GB">Hello. Your Twilio webhook is working on Railway. Goodbye.</Say>
-  <Hangup/>
+  <Say voice="alice">Hello from Railway. Your webhook is working.</Say>
 </Response>`);
 });
 
-// Railway sets PORT. Default to 3000 locally.
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Listening on ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Listening on ${PORT}`));
