@@ -11,24 +11,24 @@ const {
   TWILIO_ACCOUNT_SID,
   TWILIO_AUTH_TOKEN,
   TWILIO_FROM_NUMBER,
-  OPENAI_API_KEY,
   ELEVENLABS_API_KEY,
   ELEVENLABS_VOICE_ID,
-  GHL_INBOUND_WEBHOOK_URL
+  OPENAI_API_KEY,
+  GHL_BOOKING_TRIGGER_URL // <-- paste "number 3" here in Railway Variables
 } = process.env;
 
 const AGENT_NAME = process.env.AGENT_NAME || "Nicola";
 const COMPANY_NAME = process.env.COMPANY_NAME || "Greenbug Energy";
 const MAX_TURNS = parseInt(process.env.MAX_TURNS || "8", 10);
 
-// In-memory call state
-const callState = new Map(); // CallSid -> { turns, history, leadName, leadPhone, leadEmail, address, postcode, homeowner }
+// In-memory call state (fine for now)
+const callState = new Map(); // CallSid -> { turns, leadName, leadPhone, history[], formData{} }
 
-// ------------------ Health ------------------
+// ------------------ HEALTH ------------------
 app.get("/", (req, res) => res.status(200).send("OK - Greenbug Energy outbound caller running"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-// ------------------ ElevenLabs TTS ------------------
+// ------------------ ELEVENLABS TTS ------------------
 app.get("/tts", async (req, res) => {
   try {
     const text = (req.query.text || "").toString();
@@ -73,74 +73,83 @@ app.get("/tts", async (req, res) => {
   }
 });
 
-// ------------------ TEST: send a sample payload to GHL inbound webhook ------------------
-// This is ONLY to fix the "Mapping reference required" error in GHL.
-// You call this once, then pick the mapping in GHL and save the trigger.
-app.post("/send-test-to-ghl", async (req, res) => {
+// ------------------ (A) SEND TEST PAYLOAD TO GHL (for Mapping Reference) ------------------
+// Hit this in browser: https://YOUR-RAILWAY/send-test-to-ghl
+app.get("/send-test-to-ghl", async (req, res) => {
   try {
-    if (!GHL_INBOUND_WEBHOOK_URL) {
-      return res.status(500).json({ ok: false, error: "Missing GHL_INBOUND_WEBHOOK_URL env var" });
+    if (!GHL_BOOKING_TRIGGER_URL) {
+      return res.status(500).json({ ok: false, error: "Missing GHL_BOOKING_TRIGGER_URL env var" });
     }
 
     const sample = {
       intent: "BOOK",
-      source: "AI_CALL",
       agent: AGENT_NAME,
       company: COMPANY_NAME,
-      phone: "+447000000000",
+      phone: "+447700900123",
       first_name: "Test",
+      last_name: "Lead",
       email: "test@example.com",
-      address: "1 High Street",
+      address: "1 Test Street",
+      city: "Glasgow",
       postcode: "G1 1AA",
+      property_type: "House",
       homeowner: "Yes",
-      preferred_window: "Next week - afternoon",
-      transcript: "Lead: Yes please book.\nNicola: Perfect, I’ll get you booked and text details.",
-      callSid: "TEST_CALLSID"
+      preferred_day: "Next week",
+      preferred_time_window: "Morning",
+      notes: "Test payload to create mapping reference in GHL"
     };
 
-    const r = await fetch(GHL_INBOUND_WEBHOOK_URL, {
+    const r = await fetch(GHL_BOOKING_TRIGGER_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(sample)
     });
 
-    const txt = await r.text();
-    return res.status(200).json({ ok: true, status: r.status, response: txt.slice(0, 300) });
+    const text = await r.text();
+    return res.status(200).json({
+      ok: r.ok,
+      status: r.status,
+      message: "Sent sample payload to GHL inbound webhook trigger URL.",
+      ghl_response: text.slice(0, 500)
+    });
   } catch (e) {
     console.error("send-test-to-ghl error:", e);
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// ------------------ Outbound call trigger from GHL ------------------
+// ------------------ (A) SEND REAL OUTCOME TO GHL ------------------
+async function sendToGhl(payload) {
+  if (!GHL_BOOKING_TRIGGER_URL) return;
+  try {
+    await fetch(GHL_BOOKING_TRIGGER_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    console.error("sendToGhl failed:", e);
+  }
+}
+
+// ------------------ OUTBOUND CALL TRIGGER FROM GHL (lead submitted) ------------------
 app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
     const phoneRaw =
-      body.phone ||
-      body.Phone ||
-      body.contact?.phone ||
-      body.contact?.phoneNumber ||
-      body.contact?.phone_number;
+      body.phone || body.Phone ||
+      body.contact?.phone || body.contact?.phoneNumber || body.contact?.phone_number;
 
     const leadName =
-      body.name ||
-      body.full_name ||
-      body.fullName ||
-      body.contact?.name ||
-      body.contact?.firstName ||
-      body.contact?.first_name ||
+      body.name || body.full_name || body.fullName ||
+      body.contact?.name || body.contact?.firstName || body.contact?.first_name ||
       "there";
 
-    const leadEmail = body.email || body.contact?.email || "";
-    const address = body.address || body.contact?.address1 || body.contact?.address || "";
-    const postcode = body.postalCode || body.postcode || body.contact?.postalCode || body.contact?.postcode || "";
-    const homeowner = body.homeowner || body["Are You The Homeowner"] || "";
-
     if (!phoneRaw) return res.status(400).json({ ok: false, error: "Missing phone in payload" });
+
     if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_FROM_NUMBER) {
-      return res.status(500).json({ ok: false, error: "Missing Twilio env vars" });
+      return res.status(500).json({ ok: false, error: "Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER" });
     }
     if (!PUBLIC_BASE_URL) return res.status(500).json({ ok: false, error: "Missing PUBLIC_BASE_URL" });
 
@@ -152,7 +161,7 @@ app.post("/ghl/lead", async (req, res) => {
     const call = await client.calls.create({
       to,
       from,
-      url: `${PUBLIC_BASE_URL}/twilio/voice?leadName=${encodeURIComponent(leadName)}&leadPhone=${encodeURIComponent(to)}&leadEmail=${encodeURIComponent(leadEmail)}&address=${encodeURIComponent(address)}&postcode=${encodeURIComponent(postcode)}&homeowner=${encodeURIComponent(homeowner)}`,
+      url: `${PUBLIC_BASE_URL}/twilio/voice?leadName=${encodeURIComponent(leadName)}&leadPhone=${encodeURIComponent(to)}`,
       method: "POST",
       statusCallback: `${PUBLIC_BASE_URL}/twilio/status`,
       statusCallbackMethod: "POST",
@@ -166,15 +175,10 @@ app.post("/ghl/lead", async (req, res) => {
   }
 });
 
-// ------------------ Twilio: start of call ------------------
+// ------------------ TWILIO: START CALL ------------------
 app.post("/twilio/voice", (req, res) => {
   const leadName = (req.query.leadName || "there").toString();
   const leadPhone = (req.query.leadPhone || "").toString();
-  const leadEmail = (req.query.leadEmail || "").toString();
-  const address = (req.query.address || "").toString();
-  const postcode = (req.query.postcode || "").toString();
-  const homeowner = (req.query.homeowner || "").toString();
-
   const callSid = (req.body.CallSid || req.query.CallSid || "").toString();
 
   if (!callState.has(callSid)) {
@@ -182,145 +186,147 @@ app.post("/twilio/voice", (req, res) => {
       turns: 0,
       leadName,
       leadPhone,
-      leadEmail,
-      address,
-      postcode,
-      homeowner,
+      formData: {}, // later: store postcode/address confirmation etc.
       history: [
         {
           role: "system",
           content:
-            `You are ${AGENT_NAME}, a friendly human-sounding phone agent for ${COMPANY_NAME} in the UK. ` +
-            `You are calling a lead who filled out a form about SOLAR PANELS / a free home energy survey. ` +
-            `Goal: confirm key details quickly and book a site survey. ` +
-            `Be natural, warm, and confident. No robotic wording. Never say you are AI.\n\n` +
-            `Rules:\n` +
-            `- Start by confirming it's a good time.\n` +
-            `- Confirm address/postcode if missing or unclear.\n` +
-            `- Ask only the minimum: homeowner? property type? daytime availability? best contact.\n` +
-            `- Handle objections: cost, "just browsing", "send info" -> offer quick survey booking.\n` +
-            `- If they want later, ask best day/time window.\n` +
-            `- When ready to book, collect a preferred day/time window (morning/afternoon) and confirm you'll text details.\n\n` +
-            `Return ONLY JSON: {"reply":"...","action":"CONTINUE|BOOK|CALLBACK|END","fields":{"preferred_window":"","notes":"","confirm_address":""}}`
+            `You are ${AGENT_NAME}, a friendly UK caller for ${COMPANY_NAME}. ` +
+            `You are calling a lead about SOLAR panels / a free home energy survey. ` +
+            `Goal: confirm key details quickly (address/postcode), check homeowner status, then book a site survey. ` +
+            `Be human, warm, not salesy. Keep responses short. Never mention you are AI. ` +
+            `If they want later, arrange callback time. If not eligible (not homeowner), politely end. ` +
+            `When ready to book: ask preferred day + morning/afternoon.`
         }
       ]
     });
   }
 
-  const state = callState.get(callSid);
-
   const opener =
     `Hi ${leadName}, it’s ${AGENT_NAME} from ${COMPANY_NAME}. ` +
-    `You’ve just checked availability for a free home energy survey about solar panels. ` +
+    `You’ve just checked availability for a free home energy survey for solar. ` +
     `Have I caught you at an okay time for a quick minute?`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(opener)}</Play>
   <Gather input="speech" action="/twilio/turn?CallSid=${encodeURIComponent(callSid)}" method="POST" speechTimeout="auto" />
-  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("Sorry, I didn’t catch that. I’ll send a quick text so you can pick a time. Bye for now.")}</Play>
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("No worries — I’ll text you so you can pick a better time. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-// ------------------ Twilio: each conversational turn ------------------
+// ------------------ TWILIO: CONVERSATION TURN ------------------
 app.post("/twilio/turn", async (req, res) => {
   const callSid = (req.query.CallSid || req.body.CallSid || "").toString();
   const speech = (req.body.SpeechResult || "").toString().trim();
 
   const state = callState.get(callSid);
-  if (!state) return res.type("text/xml").send(makeTwiMLPlayAndHangup("Sorry — something went wrong. Bye for now."));
+  if (!state) {
+    return res.type("text/xml").send(makePlayAndHangup("Sorry — something went wrong. I’ll text you shortly. Bye for now."));
+  }
 
   state.turns += 1;
+  console.log("TURN", { callSid, turn: state.turns, speech });
 
-  if (!speech) return res.type("text/xml").send(makeTwiMLPlayAndHangup("No worries — I’ll text you a link to choose a time. Bye for now."));
+  if (!speech) {
+    return res.type("text/xml").send(makePlayAndHangup("No worries — I’ll text you a link to choose a time. Bye for now."));
+  }
 
   if (state.turns >= MAX_TURNS) {
-    return res.type("text/xml").send(makeTwiMLPlayAndHangup("Thanks — I don’t want to keep you. I’ll text you the next steps. Bye for now."));
+    return res.type("text/xml").send(makePlayAndHangup("Thanks — I won’t keep you. I’ll text you the next steps. Bye for now."));
   }
 
   state.history.push({ role: "user", content: speech });
 
-  let ai = { reply: "Okay — tell me a bit more.", action: "CONTINUE", fields: {} };
+  let ai;
   try {
     ai = await getNextFromOpenAI(state.history);
   } catch (e) {
     console.error("OpenAI error:", e);
-    return res.type("text/xml").send(makeTwiMLPlayAndHangup("Sorry — quick technical issue. I’ll text you shortly to arrange the survey. Bye for now."));
+    return res.type("text/xml").send(makePlayAndHangup("Sorry — I’m having a quick technical issue. I’ll text you shortly to arrange the survey. Bye for now."));
   }
 
-  const reply = (ai.reply || "").toString().trim() || "Okay — tell me a bit more.";
-  const action = (ai.action || "CONTINUE").toString().toUpperCase();
-  const fields = ai.fields || {};
+  const { reply, action, extracted } = ai;
+
+  // Save any extracted fields (postcode/address/time window etc.)
+  if (extracted && typeof extracted === "object") {
+    state.formData = { ...state.formData, ...extracted };
+  }
 
   state.history.push({ role: "assistant", content: reply });
   callState.set(callSid, state);
 
-  // If BOOK/CALLBACK/END -> send webhook to GHL
+  // When action triggers, POST to GHL inbound webhook (A)
   if (action === "BOOK" || action === "CALLBACK" || action === "END") {
-    await postToGHLInboundWebhookSafe({
+    await sendToGhl({
       intent: action,
-      source: "AI_CALL",
       agent: AGENT_NAME,
       company: COMPANY_NAME,
       phone: state.leadPhone,
       first_name: state.leadName,
-      email: state.leadEmail,
-      address: state.address,
-      postcode: state.postcode,
-      homeowner: state.homeowner,
-      preferred_window: fields.preferred_window || "",
-      notes: fields.notes || "",
-      confirm_address: fields.confirm_address || "",
-      transcript: compactTranscript(state.history, AGENT_NAME),
-      callSid
+      ...state.formData,
+      last_user: speech,
+      agent_reply: reply
     });
 
-    // Natural close
-    const close =
+    const closing =
       action === "BOOK"
-        ? `${reply} Perfect — I’ll get that booked and text you the details now. Bye for now.`
+        ? `${reply} Perfect — I’ll text you the details now. Bye for now.`
         : action === "CALLBACK"
-          ? `${reply} No problem — I’ll arrange a callback. Bye for now.`
-          : `${reply} Thanks for your time — bye for now.`;
+          ? `${reply} No problem — I’ll arrange that and text you. Bye for now.`
+          : `${reply}`;
 
-    return res.type("text/xml").send(makeTwiMLPlayAndHangup(close));
+    return res.type("text/xml").send(makePlayAndHangup(closing));
   }
 
-  // Continue loop
+  // Continue conversation
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(reply)}</Play>
   <Gather input="speech" action="/twilio/turn?CallSid=${encodeURIComponent(callSid)}" method="POST" speechTimeout="auto" />
-  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("Sorry, I didn’t catch that. I’ll text you a link to pick a time. Bye for now.")}</Play>
+  <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent("Sorry, I didn’t catch that. I’ll text you so you can pick a time. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-// ------------------ Twilio call status callback ------------------
+// ------------------ TWILIO STATUS ------------------
 app.post("/twilio/status", (req, res) => {
-  console.log("Call status:", {
+  const payload = {
     CallSid: req.body.CallSid,
     CallStatus: req.body.CallStatus,
     To: req.body.To,
     From: req.body.From,
     Duration: req.body.CallDuration
-  });
+  };
+  console.log("Call status:", payload);
 
-  if (req.body.CallStatus === "completed") {
-    callState.delete(req.body.CallSid);
+  if (payload.CallStatus === "completed") {
+    callState.delete(payload.CallSid);
   }
-
   res.status(200).send("ok");
 });
 
-// ------------------ OpenAI helper ------------------
+// ------------------ OPENAI (SOLAR QUALIFICATION + BOOKING) ------------------
 async function getNextFromOpenAI(history) {
   if (!OPENAI_API_KEY) throw new Error("Missing OPENAI_API_KEY");
+
+  const extraSystem = {
+    role: "system",
+    content:
+      `Return ONLY valid JSON like: {"reply":"...","action":"CONTINUE|BOOK|CALLBACK|END","extracted":{...}}.\n` +
+      `Use extracted for: postcode, address_confirmed, homeowner, property_type, preferred_day, preferred_time_window.\n` +
+      `BOOK when you have: homeowner=yes AND at least postcode (or address confirmed) AND preferred_day + preferred_time_window.\n` +
+      `CALLBACK if they ask to be called later and give a time/day.\n` +
+      `END if not homeowner / not interested / wrong number.\n` +
+      `Tone: human UK phone call, short, warm, not salesy.\n`
+  };
+
+  const messages = [...history, extraSystem];
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
@@ -331,7 +337,7 @@ async function getNextFromOpenAI(history) {
     body: JSON.stringify({
       model: "gpt-4o-mini",
       temperature: 0.5,
-      messages: history
+      messages
     })
   });
 
@@ -347,41 +353,18 @@ async function getNextFromOpenAI(history) {
   try {
     parsed = JSON.parse(content);
   } catch {
-    parsed = { reply: content.slice(0, 220), action: "CONTINUE", fields: {} };
+    parsed = { reply: content.slice(0, 220), action: "CONTINUE", extracted: {} };
   }
 
-  const reply = (parsed.reply || "").toString().trim();
+  const reply = (parsed.reply || "").toString().trim() || "Okay — just a quick one: are you the homeowner at the property?";
   const actionRaw = (parsed.action || "CONTINUE").toString().toUpperCase();
   const action = ["CONTINUE", "BOOK", "CALLBACK", "END"].includes(actionRaw) ? actionRaw : "CONTINUE";
+  const extracted = parsed.extracted && typeof parsed.extracted === "object" ? parsed.extracted : {};
 
-  return { reply, action, fields: parsed.fields || {} };
+  return { reply, action, extracted };
 }
 
-// ------------------ Post to GHL inbound webhook ------------------
-async function postToGHLInboundWebhookSafe(payload) {
-  try {
-    if (!GHL_INBOUND_WEBHOOK_URL) {
-      console.log("No GHL_INBOUND_WEBHOOK_URL set. Payload (not sent):", payload.intent);
-      return;
-    }
-    await fetch(GHL_INBOUND_WEBHOOK_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload)
-    });
-  } catch (e) {
-    console.error("GHL inbound webhook failed:", e);
-  }
-}
-
-function compactTranscript(history, agentName) {
-  return history
-    .filter(m => m.role === "user" || m.role === "assistant")
-    .map(m => `${m.role === "user" ? "Lead" : agentName}: ${m.content}`)
-    .join("\n");
-}
-
-function makeTwiMLPlayAndHangup(text) {
+function makePlayAndHangup(text) {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${PUBLIC_BASE_URL}/tts?text=${encodeURIComponent(text)}</Play>
@@ -389,6 +372,6 @@ function makeTwiMLPlayAndHangup(text) {
 </Response>`;
 }
 
-// ------------------ Listen ------------------
+// ------------------ START ------------------
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
