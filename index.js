@@ -2,40 +2,32 @@ const express = require("express");
 
 const app = express();
 
-// Twilio sends application/x-www-form-urlencoded by default
+// Twilio will POST form-encoded data by default
 app.use(express.urlencoded({ extended: false }));
 
-// Root – so Railway URL doesn't look dead
+// ✅ Root route so your Railway URL actually shows something in a browser
 app.get("/", (req, res) => {
-  res.status(200).send("OK");
+  res.status(200).send("OK - Railway Node server is running");
 });
 
-// Health check
+// ✅ Health endpoint (use this to test quickly)
 app.get("/health", (req, res) => {
   res.status(200).json({ ok: true });
 });
 
-// Twilio Voice Webhook
-app.post("/voice", (req, res) => {
-  res.set("Content-Type", "text/xml");
+// ✅ Twilio Voice Webhook (returns TwiML)
+app.post("/twilio/voice", (req, res) => {
+  res.type("text/xml");
   res.send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice" language="en-GB">
-    Hello. Your Twilio webhook is working.
-  </Say>
+  <Say voice="alice">Hello. Your Twilio webhook on Railway is working.</Say>
 </Response>`);
 });
 
-// 🚨 THIS IS THE IMPORTANT PART 🚨
-// Railway injects PORT at runtime
-const PORT = process.env.PORT;
+// ✅ MUST listen on Railway's provided PORT
+const PORT = process.env.PORT || 3000;
 
-if (!PORT) {
-  console.error("PORT environment variable not set");
-  process.exit(1);
-}
-
-// Bind to all interfaces so Railway can reach it
+// ✅ Bind to 0.0.0.0 for cloud platforms
 app.listen(PORT, "0.0.0.0", () => {
-  console.log("Listening on", PORT);
+  console.log(`Listening on ${PORT}`);
 });
