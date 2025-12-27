@@ -1,8 +1,8 @@
 {
   "name": "twilio-railway-webhook",
   "version": "1.0.0",
-  "private": true,
   "main": "index.js",
+  "type": "commonjs",
   "scripts": {
     "start": "node index.js"
   },
