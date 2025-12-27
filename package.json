@@ -1,5 +1,5 @@
 {
-  "name": "twilio-railway-webhook",
+  "name": "greenbug-ai-caller",
   "version": "1.0.0",
   "main": "index.js",
   "type": "commonjs",
@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "express": "^4.19.2",
-    "twilio": "^5.5.0"
+    "twilio": "^5.5.0",
+    "node-fetch": "^3.3.2"
   }
 }
