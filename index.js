@@ -1,12 +1,6 @@
 const express = require("express");
 const twilio = require("twilio");
 
-// --- fetch fallback (prevents crashes if Node < 18) ---
-let fetchFn = global.fetch;
-if (!fetchFn) {
-  fetchFn = (...args) => import("node-fetch").then(({ default: f }) => f(...args));
-}
-
 const app = express();
 
 // GHL often sends JSON; Twilio webhooks are x-www-form-urlencoded
@@ -18,11 +12,109 @@ app.use(express.urlencoded({ extended: false }));
  *   lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
  *   transcript: [{ role: "assistant"|"user", text }],
  *   turns: number,
- *   state: "OPEN"|"CONFIRM_ADDRESS"|"ASK_DAY"|"ASK_WINDOW"|"DONE",
- *   slots: { preferred_day?: string, preferred_window?: string, confirmed_address?: string }
+ *   stage: "OPEN"|"CONFIRM_ADDRESS"|"ASK_DAY"|"ASK_WINDOW"|"CONFIRM_CLOSE"|"DONE",
+ *   retries: { confirmAddress: number, askDay: number, askWindow: number },
+ *   booking: { preferred_day, preferred_window, confirmed_address, notes }
  * }
  */
 const sessions = new Map();
+
+// Use fetch safely on Railway (Node 18+ has global fetch; fallback just in case)
+const fetchFn =
+  global.fetch ||
+  ((...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args)));
+
+// -------------------- Helpers: speech normalization --------------------
+function norm(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+function isYes(s) {
+  const t = norm(s);
+  return (
+    t === "yes" ||
+    t === "yeah" ||
+    t === "yeh" ||
+    t === "yep" ||
+    t === "aye" ||
+    t === "yup" ||
+    t.includes("yes") ||
+    t.includes("yeah") ||
+    t.includes("yeh") ||
+    t.includes("aye") ||
+    t.includes("correct") ||
+    t.includes("that’s right") ||
+    t.includes("thats right") ||
+    t.includes("right")
+  );
+}
+
+function isNo(s) {
+  const t = norm(s);
+  return (
+    t === "no" ||
+    t === "nope" ||
+    t === "nah" ||
+    t.includes("no") ||
+    t.includes("not") ||
+    t.includes("wrong") ||
+    t.includes("incorrect")
+  );
+}
+
+function extractWindow(s) {
+  const t = norm(s);
+  if (t.includes("morning") || t.includes("am") || t.includes("a.m")) return "Morning";
+  if (t.includes("afternoon") || t.includes("pm") || t.includes("p.m")) return "Afternoon";
+  if (t.includes("evening")) return "Evening"; // optional
+  return "";
+}
+
+function extractDay(s) {
+  const t = norm(s);
+  const days = [
+    "monday","tuesday","wednesday","thursday","friday","saturday","sunday",
+    "mon","tue","tues","wed","thu","thur","thurs","fri","sat","sun"
+  ];
+  for (const d of days) {
+    if (t.includes(d)) {
+      // Normalise short forms
+      if (d.startsWith("mon")) return "Monday";
+      if (d.startsWith("tue")) return "Tuesday";
+      if (d.startsWith("wed")) return "Wednesday";
+      if (d.startsWith("thu")) return "Thursday";
+      if (d.startsWith("fri")) return "Friday";
+      if (d.startsWith("sat")) return "Saturday";
+      if (d.startsWith("sun")) return "Sunday";
+    }
+  }
+  // “tomorrow” / “next week” etc (basic)
+  if (t.includes("tomorrow")) return "Tomorrow";
+  if (t.includes("next week")) return "Next week";
+  return "";
+}
+
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+function ttsUrl(baseUrl, text) {
+  return `${baseUrl}/tts?text=${encodeURIComponent(text)}`;
+}
+
+function ensureSession(callSid) {
+  if (!sessions.has(callSid)) {
+    sessions.set(callSid, {
+      lead: {},
+      transcript: [],
+      turns: 0,
+      stage: "OPEN",
+      retries: { confirmAddress: 0, askDay: 0, askWindow: 0 },
+      booking: { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "" }
+    });
+  }
+  return sessions.get(callSid);
+}
 
 // -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK - Greenbug outbound AI is running"));
@@ -33,6 +125,7 @@ app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
+    // Best-effort extraction (GHL payloads vary)
     const phoneRaw =
       body.phone ||
       body.Phone ||
@@ -123,13 +216,7 @@ app.post("/ghl/lead", async (req, res) => {
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
 
-    return res.status(200).json({
-      ok: true,
-      message: "Call triggered",
-      sid: call.sid,
-      to,
-      name
-    });
+    return res.status(200).json({ ok: true, message: "Call triggered", sid: call.sid, to, name });
   } catch (err) {
     console.error("Error in /ghl/lead:", err);
     return res.status(500).json({ ok: false, error: err.message || "Unknown error" });
@@ -150,191 +237,260 @@ app.post("/twilio/voice", async (req, res) => {
 
   const callSid = req.body.CallSid || req.query.CallSid || "";
 
-  sessions.set(callSid, {
-    lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
-    transcript: [{ role: "assistant", text: "Call started." }],
-    turns: 0,
-    state: "OPEN",
-    slots: {}
-  });
+  const session = ensureSession(callSid);
+  session.lead = { name, phone, email, address, postcode, propertyType, isHomeowner };
+  session.transcript = [{ role: "assistant", text: "Call started." }];
+  session.turns = 0;
+  session.stage = "OPEN";
+  session.retries = { confirmAddress: 0, askDay: 0, askWindow: 0 };
+  session.booking = { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "" };
 
-  const opening = `Hi ${name}. It’s Nicola from Greenbug Energy. You just requested a free home energy survey about solar panels — have I caught you at an okay time?`;
+  sessions.set(callSid, session);
+
+  const opening = `Hi ${name}. It’s Nicola from Greenbug Energy. You requested a free home energy survey about solar panels — have I caught you at an okay time?`;
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(opening)}</Play>
+  <Play>${ttsUrl(baseUrl, opening)}</Play>
   <Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="6"/>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent("No worries — I’ll send you a text and you can pick a time that suits. Bye for now.")}</Play>
+  <Play>${ttsUrl(baseUrl, "No worries — I’ll send you a text and you can pick a time that suits. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
 
   res.type("text/xml").send(twiml);
 });
 
-// -------------------- Twilio: handle speech (slot-filling + short natural flow) --------------------
+// -------------------- Twilio: speech capture (FAST response with filler) --------------------
+// IMPORTANT: This endpoint returns immediately with filler + redirect, to reduce the “dead air”.
 app.post("/twilio/speech", async (req, res) => {
   const baseUrl = process.env.PUBLIC_BASE_URL;
   const callSid = req.body.CallSid;
-  const speechRaw = (req.body.SpeechResult || "").trim();
-  const speech = normalizeSpeech(speechRaw);
+  const speech = (req.body.SpeechResult || "").trim();
   const confidence = req.body.Confidence;
 
-  const session = sessions.get(callSid) || { lead: {}, transcript: [], turns: 0, state: "OPEN", slots: {} };
+  const session = ensureSession(callSid);
   session.turns = (session.turns || 0) + 1;
 
-  if (speechRaw) session.transcript.push({ role: "user", text: speechRaw });
+  if (speech) session.transcript.push({ role: "user", text: speech });
 
-  console.log("Speech:", { callSid, speechRaw, speech, confidence, state: session.state });
+  console.log("Speech:", { callSid, speech, confidence, stage: session.stage });
 
   // Safety stop
-  if (session.turns >= 12) {
-    const bye = "Thanks — I’ll send you a quick text and we’ll take it from there. Bye for now.";
+  if (session.turns >= 14) {
+    session.stage = "DONE";
+    sessions.set(callSid, session);
+    const bye = "Thanks for that — I’ll send you a quick text and we can take it from there. Bye for now.";
     const twimlEnd = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(bye)}</Play>
+  <Play>${ttsUrl(baseUrl, bye)}</Play>
   <Hangup/>
 </Response>`;
-    sessions.set(callSid, session);
     return res.type("text/xml").send(twimlEnd);
   }
 
-  // Handle “busy / later / not interested”
-  if (isLater(speech)) {
-    const msg = withFiller("No problem at all — I’ll text you in a minute and you can pick a time that suits. Bye for now.");
-    const twimlLater = `<?xml version="1.0" encoding="UTF-8"?>
+  sessions.set(callSid, session);
+
+  // Filler to mask thinking / redirect gap
+  const filler = pick([
+    "Mm-hmm… one sec.",
+    "Okay… just checking that.",
+    "Perfect… just a moment.",
+    "Right… bear with me a sec."
+  ]);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(msg)}</Play>
+  <Play>${ttsUrl(baseUrl, filler)}</Play>
+  <Redirect method="POST">${baseUrl}/twilio/next</Redirect>
+</Response>`;
+
+  return res.type("text/xml").send(twiml);
+});
+
+// -------------------- Twilio: main logic step (after filler) --------------------
+app.post("/twilio/next", async (req, res) => {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+  const callSid = req.body.CallSid || "";
+  const session = ensureSession(callSid);
+
+  // If Twilio ever hits here without a session, be polite and end
+  if (!session.lead || !session.lead.phone) {
+    const twimlOops = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, "Sorry — I’ve lost the details on my side. I’ll send you a text to book in. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
-    sessions.set(callSid, session);
-    return res.type("text/xml").send(twimlLater);
+    return res.type("text/xml").send(twimlOops);
   }
 
-  if (isNotInterested(speech)) {
-    const msg = withFiller("No worries — thanks for your time. If you ever want a survey later, just reply to our text. Bye for now.");
-    const twimlNo = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(msg)}</Play>
-  <Hangup/>
-</Response>`;
-    sessions.set(callSid, session);
-    return res.type("text/xml").send(twimlNo);
+  const lastUser = [...session.transcript].reverse().find(t => t.role === "user")?.text || "";
+
+  // Stage machine:
+  // OPEN -> CONFIRM_ADDRESS -> ASK_DAY -> ASK_WINDOW -> CONFIRM_CLOSE -> DONE
+
+  let reply = "";
+  let shouldHangup = false;
+
+  // 1) OPEN: if they said yes-ish, move to confirm address; if no-ish, end politely.
+  if (session.stage === "OPEN") {
+    if (isNo(lastUser)) {
+      reply = "No problem at all. I’ll send you a quick text and you can pick a time that suits. Bye for now.";
+      shouldHangup = true;
+      session.stage = "DONE";
+    } else {
+      session.stage = "CONFIRM_ADDRESS";
+      // fallthrough to confirm address
+    }
   }
 
-  // If they said yes/yeah/aye to “okay time?”, move on.
-  if (session.state === "OPEN") {
-    // confirm address step (only once)
-    session.state = "CONFIRM_ADDRESS";
+  // 2) CONFIRM_ADDRESS (but DO NOT ask for full address again if we already have it)
+  if (session.stage === "CONFIRM_ADDRESS") {
+    const hasAddress = !!norm(session.lead.address);
+    const hasPostcode = !!norm(session.lead.postcode);
+
+    // If we have address+postcode, confirm it (once), otherwise ask for missing piece.
+    if (hasAddress || hasPostcode) {
+      const addrLine = [session.lead.address, session.lead.postcode].filter(Boolean).join(", ");
+      if (session.retries.confirmAddress === 0) {
+        reply = `Perfect. I’ve got the survey address as ${addrLine}. Is that correct?`;
+        session.retries.confirmAddress++;
+      } else {
+        // We’re expecting a yes/no now
+        if (isYes(lastUser)) {
+          session.booking.confirmed_address = addrLine;
+          session.stage = "ASK_DAY";
+        } else if (isNo(lastUser)) {
+          reply = "No worries — what’s the correct postcode for the survey address?";
+          session.retries.confirmAddress++;
+          // stay in CONFIRM_ADDRESS but now we’re collecting postcode
+          session.booking.notes = (session.booking.notes || "") + " Address mismatch reported.";
+        } else {
+          // Didn’t catch yes/no
+          reply = "Sorry — just to confirm, is that address correct?";
+          session.retries.confirmAddress++;
+        }
+
+        // If too many retries, bail to text
+        if (session.retries.confirmAddress >= 4 && session.stage === "CONFIRM_ADDRESS") {
+          reply = "No worries — I’ll send you a text to confirm the address and get you booked in. Bye for now.";
+          shouldHangup = true;
+          session.stage = "DONE";
+        }
+      }
+    } else {
+      // Missing address info entirely
+      if (session.retries.confirmAddress === 0) {
+        reply = "Quick one — what’s the postcode for the survey address?";
+        session.retries.confirmAddress++;
+      } else {
+        // If user said a postcode, store it
+        const maybe = norm(lastUser);
+        if (maybe.length >= 5) {
+          session.lead.postcode = lastUser.trim();
+          session.booking.confirmed_address = session.lead.postcode;
+          session.stage = "ASK_DAY";
+        } else {
+          reply = "Sorry — what’s the postcode there?";
+          session.retries.confirmAddress++;
+        }
+      }
+    }
   }
 
-  // CONFIRM_ADDRESS: if we have address, confirm it; else ask for it.
-  if (session.state === "CONFIRM_ADDRESS") {
-    const addr = (session.lead.address || "").trim();
-    const pc = (session.lead.postcode || "").trim();
+  // 3) ASK_DAY
+  if (session.stage === "ASK_DAY") {
+    const day = extractDay(lastUser);
 
-    if (addr || pc) {
-      // if they already confirmed once, don’t loop
-      if (!session.slots.confirmed_address) {
-        const confirmLine =
-          addr && pc
-            ? `Perfect — I’ve got the address as ${addr}, ${pc}. Is that correct?`
-            : addr
-              ? `Perfect — I’ve got the address as ${addr}. Is that correct?`
-              : `Perfect — I’ve got your postcode as ${pc}. Is that correct?`;
-
-        const msg = withFiller(confirmLine);
-        const twiml = twimlGather(baseUrl, msg, 7);
-        sessions.set(callSid, session);
-        return res.type("text/xml").send(twiml);
+    if (!day) {
+      if (session.retries.askDay === 0) {
+        reply = "Lovely. What day suits you best for the survey?";
+        session.retries.askDay++;
+      } else {
+        // If they answered but we didn't parse a day, ask again with examples
+        reply = "No worries — is that more like Monday, Tuesday, or later in the week?";
+        session.retries.askDay++;
       }
 
-      // If already confirmed, move on
-      session.state = "ASK_DAY";
+      if (session.retries.askDay >= 4) {
+        reply = "No problem — I’ll text you a link to pick a day that suits. Bye for now.";
+        shouldHangup = true;
+        session.stage = "DONE";
+      }
     } else {
-      const msg = withFiller("Brilliant — what’s the best address or postcode for the survey?");
-      const twiml = twimlGather(baseUrl, msg, 8);
-      sessions.set(callSid, session);
-      return res.type("text/xml").send(twiml);
+      session.booking.preferred_day = day;
+      session.stage = "ASK_WINDOW";
     }
   }
 
-  // If we asked “is that correct?” — accept yeh/aye/yes and mark confirmed once.
-  if (!session.slots.confirmed_address && looksLikeYes(speech)) {
-    session.slots.confirmed_address = "yes";
-    session.state = "ASK_DAY";
-  } else if (!session.slots.confirmed_address && looksLikeNo(speech)) {
-    // If they correct it, capture whatever they said as new address snippet (basic)
-    session.slots.confirmed_address = "corrected";
-    if (speechRaw) {
-      session.lead.address = speechRaw; // best-effort
+  // 4) ASK_WINDOW
+  if (session.stage === "ASK_WINDOW") {
+    const win = extractWindow(lastUser);
+
+    if (!win) {
+      if (session.retries.askWindow === 0) {
+        reply = "Great — would you prefer morning or afternoon?";
+        session.retries.askWindow++;
+      } else {
+        reply = "Just checking — morning or afternoon work better for you?";
+        session.retries.askWindow++;
+      }
+
+      if (session.retries.askWindow >= 4) {
+        reply = "No worries — I’ll text you to choose a time window. Bye for now.";
+        shouldHangup = true;
+        session.stage = "DONE";
+      }
+    } else {
+      session.booking.preferred_window = win;
+      session.stage = "CONFIRM_CLOSE";
     }
-    session.state = "ASK_DAY";
   }
 
-  // ASK_DAY: get preferred day (Mon/Tue/etc or “tomorrow/next week”)
-  if (session.state === "ASK_DAY") {
-    // try extract from their latest speech first
-    const day = extractDay(speechRaw);
-    if (day) session.slots.preferred_day = day;
-
-    if (!session.slots.preferred_day) {
-      const msg = withFiller("Lovely — what day suits you best for the survey?");
-      const twiml = twimlGather(baseUrl, msg, 7);
-      sessions.set(callSid, session);
-      return res.type("text/xml").send(twiml);
-    }
-
-    session.state = "ASK_WINDOW";
-  }
-
-  // ASK_WINDOW: morning/afternoon
-  if (session.state === "ASK_WINDOW") {
-    const win = extractWindow(speechRaw);
-    if (win) session.slots.preferred_window = win;
-
-    if (!session.slots.preferred_window) {
-      const msg = withFiller("And is that better in the morning or the afternoon?");
-      const twiml = twimlGather(baseUrl, msg, 7);
-      sessions.set(callSid, session);
-      return res.type("text/xml").send(twiml);
+  // 5) CONFIRM_CLOSE -> post to GHL webhook once and end
+  if (session.stage === "CONFIRM_CLOSE") {
+    // Post booking webhook
+    try {
+      await postToGhlBookingWebhook({
+        lead: session.lead,
+        booking: session.booking,
+        transcript: session.transcript
+      });
+    } catch (e) {
+      console.error("GHL webhook post failed:", e?.message || e);
+      // Still close politely
     }
 
-    session.state = "DONE";
+    reply = `Perfect. I’ve got ${session.booking.preferred_day} ${session.booking.preferred_window}. I’ll send you a text or email confirmation, and if you need to change it you can just reply. Thanks so much — bye for now.`;
+    shouldHangup = true;
+    session.stage = "DONE";
   }
 
-  // DONE: post to GHL webhook + close call
-  if (session.state === "DONE") {
-    const final = withFiller(
-      `Perfect. I’ll get that booked in for ${session.slots.preferred_day} ${session.slots.preferred_window}. ` +
-      `We’ll send you a text to confirm — and if you need to change anything, just reply to it. Bye for now.`
-    );
-
-    // post booking (don’t block the hangup if it errors)
-    postToGhlBookingWebhook({
-      lead: session.lead,
-      booking: {
-        preferred_day: session.slots.preferred_day,
-        preferred_window: session.slots.preferred_window,
-        confirmed_address: session.lead.address || session.lead.postcode || "",
-        notes: ""
-      },
-      transcript: session.transcript
-    }).catch((e) => console.error("GHL webhook post failed:", e?.message || e));
-
-    sessions.set(callSid, session);
-
-    const twimlDone = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(final)}</Play>
-  <Hangup/>
-</Response>`;
-    return res.type("text/xml").send(twimlDone);
+  // If we didn’t set a reply (can happen on stage transitions), prompt appropriately
+  if (!reply && session.stage === "ASK_DAY") reply = "What day suits you best for the survey?";
+  if (!reply && session.stage === "ASK_WINDOW") reply = "Morning or afternoon work better?";
+  if (!reply && session.stage === "CONFIRM_ADDRESS") {
+    const addrLine = [session.lead.address, session.lead.postcode].filter(Boolean).join(", ");
+    reply = `I’ve got the address as ${addrLine}. Is that correct?`;
   }
 
-  // Fallback (shouldn’t really hit)
-  const msg = withFiller("Sorry — can you say that one more time?");
-  const twiml = twimlGather(baseUrl, msg, 7);
+  session.transcript.push({ role: "assistant", text: reply });
   sessions.set(callSid, session);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, reply)}</Play>
+  ${
+    shouldHangup
+      ? "<Hangup/>"
+      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="7"/>`
+  }
+  ${
+    shouldHangup
+      ? ""
+      : `<Play>${ttsUrl(baseUrl, "Sorry — I didn’t catch that. Can you say that one more time?")}</Play>`
+  }
+</Response>`;
+
   return res.type("text/xml").send(twiml);
 });
 
@@ -349,6 +505,7 @@ app.get("/tts", async (req, res) => {
     }
 
     const safeText = text.slice(0, 600);
+
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
 
@@ -437,87 +594,6 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
     const errText = await r.text().catch(() => "");
     throw new Error(`GHL webhook failed: ${r.status} ${errText}`);
   }
-}
-
-// -------------------- Helpers --------------------
-function twimlGather(baseUrl, text, timeoutSeconds) {
-  return `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(text)}</Play>
-  <Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="${timeoutSeconds}"/>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent("Sorry — I didn’t catch that. Can you say that one more time?")}</Play>
-</Response>`;
-}
-
-function normalizeSpeech(s) {
-  return String(s || "")
-    .toLowerCase()
-    .replace(/[^\w\s']/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function looksLikeYes(s) {
-  const t = normalizeSpeech(s);
-  return ["yes", "yeah", "yeh", "yep", "yup", "aye", "correct", "that's right", "thats right", "right"].some((k) =>
-    t.includes(k)
-  );
-}
-
-function looksLikeNo(s) {
-  const t = normalizeSpeech(s);
-  return ["no", "nah", "nope", "not really", "wrong", "incorrect"].some((k) => t.includes(k));
-}
-
-function isLater(s) {
-  const t = normalizeSpeech(s);
-  return ["later", "not now", "busy", "call back", "another time", "tomorrow", "text me"].some((k) => t.includes(k));
-}
-
-function isNotInterested(s) {
-  const t = normalizeSpeech(s);
-  return ["not interested", "stop", "don't call", "dont call", "leave me alone"].some((k) => t.includes(k));
-}
-
-function extractWindow(raw) {
-  const t = normalizeSpeech(raw);
-  if (t.includes("morning") || t.includes("am")) return "morning";
-  if (t.includes("afternoon") || t.includes("pm") || t.includes("evening")) return "afternoon";
-  return "";
-}
-
-function extractDay(raw) {
-  const t = normalizeSpeech(raw);
-  const days = [
-    ["monday", "mon"],
-    ["tuesday", "tue", "tues"],
-    ["wednesday", "wed"],
-    ["thursday", "thu", "thur", "thurs"],
-    ["friday", "fri"],
-    ["saturday", "sat"],
-    ["sunday", "sun"]
-  ];
-  for (const [full, ...alts] of days) {
-    if (t.includes(full) || alts.some((a) => t.includes(a))) return full;
-  }
-  if (t.includes("tomorrow")) return "tomorrow";
-  if (t.includes("next week")) return "next week";
-  return "";
-}
-
-function withFiller(text) {
-  // make it feel human + hides “thinking” gap a bit
-  const fillers = [
-    "Mm-hmm. ",
-    "Okay. ",
-    "Right. ",
-    "One sec… ",
-    "Got you. ",
-    "Perfect. "
-  ];
-  // ~35% chance
-  if (Math.random() < 0.35) return fillers[Math.floor(Math.random() * fillers.length)] + text;
-  return text;
 }
 
 // IMPORTANT: listen on Railway port
