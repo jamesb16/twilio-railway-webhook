@@ -7,116 +7,167 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
-// -------------------- In-memory call sessions --------------------
 /**
  * sessions[CallSid] = {
  *   lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
  *   transcript: [{ role: "assistant"|"user", text }],
- *   turns: number,
- *   pending_user_utterance: string
+ *   turns: number
  * }
  */
 const sessions = new Map();
 
-// -------------------- Simple TTS cache (cuts “filler” latency hard) --------------------
-const ttsCache = new Map(); // key=text -> Buffer(audio)
+// Small in-memory cache for TTS buffers (helps a bit with repeat phrases)
+const ttsCache = new Map();
+const TTS_CACHE_MAX = 200;
 
-// -------------------- Helpers --------------------
-function normalizeYesNo(value) {
-  if (value === undefined || value === null) return "";
-  const v = String(value).trim().toLowerCase();
-  if (!v) return "";
-  if (["yes", "y", "true", "1"].includes(v)) return "Yes";
-  if (["no", "n", "false", "0"].includes(v)) return "No";
-  // sometimes GHL sends "Yes " or "YES" etc
-  if (v.includes("yes")) return "Yes";
-  if (v.includes("no")) return "No";
-  return String(value).trim();
+function cacheSet(key, val) {
+  if (ttsCache.size >= TTS_CACHE_MAX) {
+    // delete oldest
+    const firstKey = ttsCache.keys().next().value;
+    if (firstKey) ttsCache.delete(firstKey);
+  }
+  ttsCache.set(key, val);
 }
 
-function pickRandom(arr) {
-  return arr[Math.floor(Math.random() * arr.length)];
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v === undefined || v === null) continue;
+    const s = String(v).trim();
+    if (s) return s;
+  }
+  return "";
 }
 
-// A few “natural” fillers to mask the response gap
-const FILLERS = [
-  "Mm-hm — just a sec.",
-  "Okay… one moment.",
-  "Got you. Just checking that now.",
-  "No worries — bear with me a second.",
-  "Okay — system’s being a bit slow right now.",
-  "Alright, give me two seconds."
-];
+function asYesNo(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "";
+  if (["true", "yes", "y", "yeah", "yeh", "yep", "aye", "i am", "correct"].some(x => s === x)) return "Yes";
+  if (["false", "no", "n", "nah", "nope", "not"].some(x => s === x)) return "No";
+  // Sometimes comes through as "Yes " / "No " etc
+  if (s.includes("yes")) return "Yes";
+  if (s.includes("no")) return "No";
+  return String(v).trim();
+}
+
+function normalizePhone(p) {
+  if (!p) return "";
+  return String(p).trim();
+}
+
+function looksLikeHomeownerQuestion(text) {
+  return /home\s*owner|homeowner|own the property|are you the owner/i.test(text || "");
+}
 
 // -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK - Greenbug outbound AI is running"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+
+// Optional helper: send a test payload into your GHL booking trigger (useful for mapping reference)
+app.get("/send-test-to-ghl", async (req, res) => {
+  try {
+    await postToGhlBookingWebhook({
+      lead: {
+        name: "Test Lead",
+        phone: "+447700900000",
+        email: "test@example.com",
+        address: "1 Test Street",
+        postcode: "G1 1AA",
+        propertyType: "Detached",
+        isHomeowner: "Yes"
+      },
+      booking: { preferred_day: "next week", preferred_window: "afternoon", notes: "Test mapping reference payload" },
+      transcript: [{ role: "assistant", text: "Lead: I'd like solar." }, { role: "user", text: "Nicola: Great, I’ll book a survey." }]
+    });
+    return res.json({ ok: true });
+  } catch (e) {
+    return res.status(500).json({ ok: false, error: e?.message || String(e) });
+  }
+});
 
 // -------------------- Trigger outbound call from GHL --------------------
 app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
-    const phoneRaw =
-      body.phone ||
-      body.Phone ||
-      body.contact?.phone ||
-      body.contact?.phoneNumber ||
-      body.contact?.phone_number;
+    // GHL payloads vary wildly. Try common containers first:
+    const leadObj =
+      body.lead ||
+      body.contact ||
+      body.inboundWebhookRequest?.lead ||
+      body.inboundWebhookRequest?.contact ||
+      body.data?.lead ||
+      body.data?.contact ||
+      body;
 
-    const name =
-      body.name ||
-      body.full_name ||
-      body.fullName ||
-      body.contact?.name ||
-      [body.contact?.firstName, body.contact?.lastName].filter(Boolean).join(" ") ||
-      body.contact?.first_name ||
-      "there";
+    const phoneRaw = pickFirst(
+      leadObj.phone,
+      leadObj.Phone,
+      leadObj.phoneNumber,
+      leadObj.phone_number,
+      body.phone,
+      body.Phone
+    );
 
-    const email =
-      body.email ||
-      body.Email ||
-      body.contact?.email ||
-      body.contact?.emailAddress ||
-      "";
+    const name = pickFirst(
+      leadObj.name,
+      leadObj.full_name,
+      leadObj.fullName,
+      body.name,
+      body.full_name,
+      [leadObj.firstName, leadObj.lastName].filter(Boolean).join(" "),
+      [leadObj.first_name, leadObj.last_name].filter(Boolean).join(" "),
+      "there"
+    );
 
-    const address =
-      body.address ||
-      body.Address ||
-      body.contact?.address1 ||
-      body.contact?.address ||
-      "";
+    const email = pickFirst(leadObj.email, leadObj.Email, leadObj.emailAddress, body.email, body.Email);
 
-    const postcode =
-      body.postcode ||
-      body.postCode ||
-      body.Postcode ||
-      body.contact?.postalCode ||
-      body.contact?.postcode ||
-      "";
+    const address = pickFirst(
+      leadObj.address,
+      leadObj.Address,
+      leadObj.address1,
+      leadObj.street,
+      body.address,
+      body.Address
+    );
 
-    const propertyType =
-      body.propertyType ||
-      body["Property Type"] ||
-      body.contact?.propertyType ||
-      "";
+    const postcode = pickFirst(
+      leadObj.postcode,
+      leadObj.postCode,
+      leadObj.Postcode,
+      leadObj.postalCode,
+      leadObj.postal_code,
+      body.postcode,
+      body.postCode,
+      body.Postcode
+    );
 
-    // IMPORTANT: normalise homeowner so the AI can trust it
-    const isHomeownerRaw =
-      body.isHomeowner ||
-      body["Are You The Homeowner"] ||
-      body.contact?.isHomeowner ||
-      "";
+    const propertyType = pickFirst(
+      leadObj.propertyType,
+      leadObj.property_type,
+      leadObj["Property Type"],
+      leadObj.property,
+      body.propertyType,
+      body["Property Type"]
+    );
 
-    const isHomeowner = normalizeYesNo(isHomeownerRaw);
+    // Homeowner often comes through under different keys
+    const homeownerRaw = pickFirst(
+      leadObj.isHomeowner,
+      leadObj.homeowner,
+      leadObj["Are You The Homeowner"],
+      leadObj["Are you the homeowner"],
+      leadObj.areYouTheHomeowner,
+      leadObj.are_you_the_homeowner,
+      body.isHomeowner,
+      body.homeowner,
+      body["Are You The Homeowner"]
+    );
+    const isHomeowner = asYesNo(homeownerRaw);
 
-    if (!phoneRaw) {
-      return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
-    }
+    const to = normalizePhone(phoneRaw);
+    if (!to) return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
 
-    const to = String(phoneRaw).trim();
     const from = process.env.TWILIO_FROM_NUMBER;
-
     if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !from) {
       return res.status(500).json({
         ok: false,
@@ -139,11 +190,9 @@ app.post("/ghl/lead", async (req, res) => {
       from,
       url: `${baseUrl}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(
         to
-      )}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(
-        address
-      )}&postcode=${encodeURIComponent(postcode)}&propertyType=${encodeURIComponent(
-        propertyType
-      )}&isHomeowner=${encodeURIComponent(isHomeowner)}`,
+      )}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}&postcode=${encodeURIComponent(
+        postcode
+      )}&propertyType=${encodeURIComponent(propertyType)}&isHomeowner=${encodeURIComponent(isHomeowner)}`,
       method: "POST",
       statusCallback: `${baseUrl}/twilio/status`,
       statusCallbackMethod: "POST",
@@ -155,7 +204,8 @@ app.post("/ghl/lead", async (req, res) => {
       message: "Call triggered",
       sid: call.sid,
       to,
-      name
+      name,
+      extracted: { email, address, postcode, propertyType, isHomeowner }
     });
   } catch (err) {
     console.error("Error in /ghl/lead:", err);
@@ -173,23 +223,25 @@ app.post("/twilio/voice", async (req, res) => {
   const address = (req.query.address || "").toString();
   const postcode = (req.query.postcode || "").toString();
   const propertyType = (req.query.propertyType || "").toString();
-  const isHomeowner = normalizeYesNo((req.query.isHomeowner || "").toString());
+  const isHomeowner = (req.query.isHomeowner || "").toString();
 
   const callSid = req.body.CallSid || req.query.CallSid || "";
 
   sessions.set(callSid, {
     lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
     transcript: [{ role: "assistant", text: "Call started." }],
-    turns: 0,
-    pending_user_utterance: ""
+    turns: 0
   });
 
   const opening = `Hi ${name}. It’s Nicola from Greenbug Energy. You just requested a free home energy survey about solar panels — have I caught you at an okay time?`;
 
+  // Hints help recognition of UK “yes” variants
+  const hints = "yes,yeah,yeh,yep,aye,no,nah,nope,now,later,busy,call back";
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${baseUrl}/tts?text=${encodeURIComponent(opening)}</Play>
-  <Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="6"/>
+  <Gather input="speech" language="en-GB" hints="${hints}" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="1" timeout="5"/>
   <Play>${baseUrl}/tts?text=${encodeURIComponent("No worries — I’ll send you a text and you can pick a time that suits. Bye for now.")}</Play>
   <Hangup/>
 </Response>`;
@@ -197,76 +249,43 @@ app.post("/twilio/voice", async (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// -------------------- Twilio: handle speech (FAST) --------------------
-// We do NOT call OpenAI here. We reply immediately with a filler + redirect.
-// This dramatically reduces the “gap” feeling.
+// -------------------- Twilio: handle speech + continue conversation --------------------
 app.post("/twilio/speech", async (req, res) => {
   const baseUrl = process.env.PUBLIC_BASE_URL;
   const callSid = req.body.CallSid;
   const speech = (req.body.SpeechResult || "").trim();
+  const confidence = req.body.Confidence;
 
-  const session = sessions.get(callSid) || { lead: {}, transcript: [], turns: 0, pending_user_utterance: "" };
+  const session = sessions.get(callSid) || { lead: {}, transcript: [], turns: 0 };
   session.turns = (session.turns || 0) + 1;
 
   if (speech) session.transcript.push({ role: "user", text: speech });
-  session.pending_user_utterance = speech;
 
-  sessions.set(callSid, session);
+  console.log("Speech:", { callSid, speech, confidence, lead: session.lead });
 
   // Safety stop
-  if (session.turns >= 10) {
-    const bye = "Thanks for that — I’ll send you a quick text and we can take it from there. Bye for now.";
+  if (session.turns >= 12) {
+    const bye = "Thanks — I’ll send you a quick text and we can take it from there. Bye for now.";
     const twimlEnd = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${baseUrl}/tts?text=${encodeURIComponent(bye)}</Play>
   <Hangup/>
 </Response>`;
+    sessions.set(callSid, session);
     return res.type("text/xml").send(twimlEnd);
   }
 
-  const filler = pickRandom(FILLERS);
+  const ai = await getAiTurn({
+    lead: session.lead,
+    transcript: session.transcript
+  });
 
-  // Play filler, then redirect to /twilio/next where we generate the real reply
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent(filler)}</Play>
-  <Redirect method="POST">${baseUrl}/twilio/next</Redirect>
-</Response>`;
-
-  return res.type("text/xml").send(twiml);
-});
-
-// -------------------- Twilio: next step (SLOW) --------------------
-// This is where we call OpenAI and decide what to say next.
-app.post("/twilio/next", async (req, res) => {
-  const baseUrl = process.env.PUBLIC_BASE_URL;
-  const callSid = req.body.CallSid || req.query.CallSid;
-
-  const session = sessions.get(callSid);
-  if (!session) {
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${baseUrl}/tts?text=${encodeURIComponent("Sorry — something glitched on my side. I’ll send you a text instead.")}</Play>
-  <Hangup/>
-</Response>`;
-    return res.type("text/xml").send(twiml);
-  }
-
-  // Get AI reply + intent
-  let ai;
-  try {
-    ai = await getAiTurn({
-      lead: session.lead,
-      transcript: session.transcript
-    });
-  } catch (e) {
-    console.error("getAiTurn failed:", e);
-    ai = {
-      reply: fallbackNextQuestion(session.lead),
-      intent: "CONTINUE",
-      end_state: "CONTINUE",
-      booking: {}
-    };
+  // If homeowner already known, do NOT allow the AI to keep asking it
+  if (session.lead?.isHomeowner && looksLikeHomeownerQuestion(ai.reply)) {
+    const p = session.lead.postcode ? `the postcode is still ${session.lead.postcode}` : "your postcode";
+    ai.reply = `Perfect — I’ve already got that noted from the form, so I won’t bore you with it 😊 Quick one: can you just confirm ${p}?`;
+    ai.intent = "CONTINUE";
+    ai.end_state = "CONTINUE";
   }
 
   session.transcript.push({ role: "assistant", text: ai.reply });
@@ -287,13 +306,15 @@ app.post("/twilio/next", async (req, res) => {
 
   const shouldHangup = ["BOOKED_DONE", "NOT_INTERESTED", "LATER_DONE"].includes(ai.end_state);
 
+  const hints = "yes,yeah,yeh,yep,aye,no,nah,nope,morning,afternoon,next week,weekday,weekend,busy,call back";
+
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${baseUrl}/tts?text=${encodeURIComponent(ai.reply)}</Play>
   ${
     shouldHangup
       ? "<Hangup/>"
-      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="7"/>`
+      : `<Gather input="speech" language="en-GB" hints="${hints}" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="1" timeout="6"/>`
   }
   ${
     shouldHangup
@@ -302,18 +323,8 @@ app.post("/twilio/next", async (req, res) => {
   }
 </Response>`;
 
-  return res.type("text/xml").send(twiml);
+  res.type("text/xml").send(twiml);
 });
-
-// If OpenAI gives non-JSON, we ask something sensible WITHOUT looping homeowner if already known
-function fallbackNextQuestion(lead) {
-  const homeowner = normalizeYesNo(lead?.isHomeowner || "");
-  if (!lead?.postcode && lead?.address) return "Perfect — what’s the postcode for that address?";
-  if (!lead?.address) return "Quick one — what’s the full address for the property you want the survey on?";
-  if (homeowner === "Yes") return "Lovely — and is the roof mostly clear, or is there much shade from trees or nearby buildings?";
-  if (homeowner === "No") return "No worries — are you the tenant or are you enquiring on someone’s behalf?";
-  return "Perfect — and is this for a house or a flat?";
-}
 
 // -------------------- ElevenLabs TTS endpoint (Twilio plays this) --------------------
 app.get("/tts", async (req, res) => {
@@ -321,21 +332,23 @@ app.get("/tts", async (req, res) => {
     const text = String(req.query.text || "").trim();
     if (!text) return res.status(400).send("Missing text");
 
-    // Cache hit = very fast
-    if (ttsCache.has(text)) {
+    // Serve from cache if we can (helps the “repeat” bits)
+    const cacheKey = text;
+    const cached = ttsCache.get(cacheKey);
+    if (cached) {
       res.setHeader("Content-Type", "audio/mpeg");
       res.setHeader("Cache-Control", "no-store");
-      return res.status(200).send(ttsCache.get(text));
+      return res.status(200).send(cached);
     }
 
     if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
-      return res.status(500).send("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
+      // Return short silence instead of crashing the call
+      res.setHeader("Content-Type", "audio/mpeg");
+      return res.status(200).send(Buffer.alloc(8));
     }
 
     const safeText = text.slice(0, 600);
     const voiceId = process.env.ELEVENLABS_VOICE_ID;
-
-    // Correct ElevenLabs endpoint:
     const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
 
     const r = await fetch(url, {
@@ -358,17 +371,21 @@ app.get("/tts", async (req, res) => {
     if (!r.ok) {
       const errText = await r.text().catch(() => "");
       console.error("ElevenLabs error:", r.status, errText);
-      return res.status(500).send("TTS failed");
+      // Return silence so Twilio doesn’t throw “application error”
+      res.setHeader("Content-Type", "audio/mpeg");
+      return res.status(200).send(Buffer.alloc(8));
     }
 
     const audio = Buffer.from(await r.arrayBuffer());
-    ttsCache.set(text, audio); // store exact text audio
+    cacheSet(cacheKey, audio);
+
     res.setHeader("Content-Type", "audio/mpeg");
     res.setHeader("Cache-Control", "no-store");
     return res.status(200).send(audio);
   } catch (e) {
     console.error("TTS error:", e);
-    return res.status(500).send("TTS crashed");
+    res.setHeader("Content-Type", "audio/mpeg");
+    return res.status(200).send(Buffer.alloc(8));
   }
 });
 
@@ -388,7 +405,6 @@ app.post("/twilio/status", (req, res) => {
   if (payload.CallStatus === "completed") {
     sessions.delete(payload.CallSid);
   }
-
   res.status(200).send("ok");
 });
 
@@ -398,31 +414,9 @@ async function getAiTurn({ lead, transcript }) {
     return {
       reply: "Sorry — I’m having a little technical hiccup. I’ll send you a text to get you booked in.",
       intent: "LATER",
-      end_state: "LATER_DONE",
-      booking: {}
+      end_state: "LATER_DONE"
     };
   }
-
-  const homeowner = normalizeYesNo(lead?.isHomeowner || "");
-
-  const system = `
-You are "Nicola", a friendly UK caller for Greenbug Energy.
-Context: You are calling a lead who filled a form requesting a FREE home energy survey about solar panels.
-Goal: Have a natural conversation and book a site survey.
-
-Hard Rules (IMPORTANT):
-- Ask ONE question at a time.
-- Keep it human, warm, short sentences. UK tone.
-- If the form already has isHomeowner as "Yes" or "No", DO NOT ask "are you the homeowner" again. Just acknowledge it and move on.
-- Only ask homeowner if isHomeowner is blank/unknown.
-- Confirm ADDRESS only if missing/unclear. If address exists, just confirm postcode briefly.
-- To BOOK: ask for preferred day + whether morning/afternoon. Do NOT promise an exact time. Say you'll text confirmation.
-
-Output MUST be valid JSON only with keys: reply, intent, end_state, booking
-intent must be one of: CONTINUE, BOOK, LATER, NOT_INTERESTED
-end_state must be one of: CONTINUE, BOOKED_DONE, LATER_DONE, NOT_INTERESTED
-booking may include: preferred_day, preferred_window, notes, confirmed_address
-`.trim();
 
   const leadSummary = {
     name: lead?.name || "",
@@ -431,12 +425,32 @@ booking may include: preferred_day, preferred_window, notes, confirmed_address
     address: lead?.address || "",
     postcode: lead?.postcode || "",
     propertyType: lead?.propertyType || "",
-    isHomeowner: homeowner
+    isHomeowner: lead?.isHomeowner || ""
   };
 
+  const system = `
+You are "Nicola", a friendly UK caller for Greenbug Energy.
+Context: You are calling a lead who filled a form requesting a FREE home energy survey about solar panels.
+Goal: Have a natural conversation and get them booked for a site survey.
+
+Rules:
+- Sound human, warm, short sentences. UK tone. No robotic scripts.
+- It’s okay to use tiny fillers sometimes: "mm-hmm", "okay", "got it".
+- Ask ONE question at a time.
+- IMPORTANT: If isHomeowner is already provided in the form data, DO NOT ask the homeowner question again. Treat it as known and move on.
+- Confirm the ADDRESS only if missing/unclear. If already provided, just confirm postcode.
+- Qualify lightly: property type, approx monthly electric bill, roof shading, timeframe to install.
+- If they are busy: offer to text and book later. If not interested: be polite and end.
+- To BOOK: ask for preferred day and whether morning/afternoon. Do NOT promise an exact time. Say you’ll text confirmation.
+- Output MUST be valid JSON only with keys: reply, intent, end_state, booking
+- intent must be one of: CONTINUE, BOOK, LATER, NOT_INTERESTED
+- end_state must be one of: CONTINUE, BOOKED_DONE, LATER_DONE, NOT_INTERESTED
+- booking is an object and may include: preferred_day, preferred_window, notes, confirmed_address
+`;
+
   const messages = [
-    { role: "system", content: system },
-    { role: "user", content: `Lead details from form: ${JSON.stringify(leadSummary)}` },
+    { role: "system", content: system.trim() },
+    { role: "user", content: `Form data (treat as truth if present): ${JSON.stringify(leadSummary)}` },
     ...transcript.slice(-10).map((t) => ({
       role: t.role === "assistant" ? "assistant" : "user",
       content: t.text
@@ -451,7 +465,8 @@ booking may include: preferred_day, preferred_window, notes, confirmed_address
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0.35,
+      temperature: 0.3,
+      max_tokens: 220,
       messages
     })
   });
@@ -461,7 +476,7 @@ booking may include: preferred_day, preferred_window, notes, confirmed_address
 
   try {
     const parsed = JSON.parse(raw);
-    if (!parsed.reply) throw new Error("No reply in JSON");
+    if (!parsed.reply) throw new Error("No reply");
     return {
       reply: String(parsed.reply),
       intent: parsed.intent || "CONTINUE",
@@ -469,13 +484,12 @@ booking may include: preferred_day, preferred_window, notes, confirmed_address
       booking: parsed.booking || {}
     };
   } catch (e) {
-    // IMPORTANT: do NOT default to “homeowner?” here because it causes loops.
-    return {
-      reply: fallbackNextQuestion(lead),
-      intent: "CONTINUE",
-      end_state: "CONTINUE",
-      booking: {}
-    };
+    // IMPORTANT: fallback should NOT keep asking homeowner if already known
+    const fallback =
+      lead?.isHomeowner
+        ? (lead?.postcode ? `Lovely — just to confirm, is the postcode still ${lead.postcode}?` : "Lovely — can you confirm your postcode for me?")
+        : "Perfect — just a quick one: are you the homeowner at the property?";
+    return { reply: fallback, intent: "CONTINUE", end_state: "CONTINUE", booking: {} };
   }
 }
 
@@ -494,16 +508,14 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
     address: lead?.address || "",
     postcode: lead?.postcode || "",
     propertyType: lead?.propertyType || "",
-    isHomeowner: normalizeYesNo(lead?.isHomeowner || ""),
+    isHomeowner: lead?.isHomeowner || "",
     booking: {
       preferred_day: booking?.preferred_day || "",
       preferred_window: booking?.preferred_window || "",
       confirmed_address: booking?.confirmed_address || "",
       notes: booking?.notes || ""
     },
-    transcript: transcript
-      .map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`)
-      .join("\n")
+    transcript: transcript.map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`).join("\n")
   };
 
   const r = await fetch(url, {
