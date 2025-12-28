@@ -7,13 +7,10 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
-// Sessions storage
+// In-memory session storage
 const sessions = new Map();
 
-// Fetch helper for Railway environment
-const fetchFn =
-  global.fetch ||
-  ((...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args)));
+const fetchFn = global.fetch || ((...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args)));
 
 // Helper function to normalize speech input
 function norm(s) {
@@ -95,7 +92,6 @@ app.post("/ghl/lead", async (req, res) => {
 
     const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-    // Make the call
     const call = await client.calls.create({
       to,
       from,
@@ -113,10 +109,45 @@ app.post("/ghl/lead", async (req, res) => {
   }
 });
 
-// Twilio voice handling logic
+// -------------------- Calendar booking (add this) --------------------
+async function postToCalendarBooking({ lead, booking }) {
+  const url = process.env.GHL_BOOKING_TRIGGER_URL;
+  if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
+
+  const payload = {
+    agent: "Nicola",
+    source: "AI_CALL",
+    intent: "BOOK",
+    phone: lead?.phone || "",
+    name: lead?.name || "",
+    email: lead?.email || "",
+    address: lead?.address || "",
+    postcode: lead?.postcode || "",
+    propertyType: lead?.propertyType || "",
+    isHomeowner: lead?.isHomeowner || "",
+    booking: {
+      preferred_day: booking?.preferred_day || "",
+      preferred_window: booking?.preferred_window || "",
+      confirmed_address: booking?.confirmed_address || "",
+      notes: booking?.notes || ""
+    }
+  };
+
+  const r = await fetchFn(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`GHL webhook failed: ${r.status} ${errText}`);
+  }
+}
+
+// Handle incoming Twilio voice requests
 app.post("/twilio/voice", async (req, res) => {
   const baseUrl = process.env.PUBLIC_BASE_URL;
-
   const name = req.query.name || "there";
   const phone = req.query.phone || "";
   const email = req.query.email || "";
@@ -150,7 +181,7 @@ app.post("/twilio/voice", async (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// Handle speech input from the user
+// Handle speech input (gather day and window)
 app.post("/twilio/speech", async (req, res) => {
   const baseUrl = process.env.PUBLIC_BASE_URL;
   const callSid = req.body.CallSid;
@@ -182,20 +213,16 @@ app.post("/twilio/speech", async (req, res) => {
   res.type("text/xml").send(twiml);
 });
 
-// -------------------- Calendar booking webhook for GHL --------------------
-app.post("/twilio/status", async (req, res) => {
+// The `/twilio/next` can now manage flow as needed for the conversation
+
+// -------------------- Call status callback --------------------
+app.post("/twilio/status", (req, res) => {
   const payload = req.body;
   console.log("Call status:", payload);
-
-  // Simulate successful booking, can add detailed booking logic
-  const bookingResponse = {
-    status: 200,
-    message: "Calendar entry successfully created"
-  };
-
-  return res.status(bookingResponse.status).json({ message: bookingResponse.message });
+  res.status(200).send("ok");
 });
 
-app.listen(3000, () => {
-  console.log("Server is listening on port 3000");
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server is listening on port ${PORT}`);
 });
