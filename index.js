@@ -125,59 +125,15 @@ app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
-    // Best-effort extraction (GHL payloads vary)
-    const phoneRaw =
-      body.phone ||
-      body.Phone ||
-      body.contact?.phone ||
-      body.contact?.phoneNumber ||
-      body.contact?.phone_number;
-
-    const name =
-      body.name ||
-      body.full_name ||
-      body.fullName ||
-      body.contact?.name ||
-      [body.contact?.firstName, body.contact?.lastName].filter(Boolean).join(" ") ||
-      body.contact?.first_name ||
-      "there";
-
-    const email =
-      body.email ||
-      body.Email ||
-      body.contact?.email ||
-      body.contact?.emailAddress ||
-      "";
-
-    const address =
-      body.address ||
-      body.Address ||
-      body.contact?.address1 ||
-      body.contact?.address ||
-      "";
-
-    const postcode =
-      body.postcode ||
-      body.postCode ||
-      body.Postcode ||
-      body.contact?.postalCode ||
-      body.contact?.postcode ||
-      "";
-
-    const propertyType =
-      body.propertyType ||
-      body["Property Type"] ||
-      body.contact?.propertyType ||
-      "";
-
-    const isHomeowner =
-      body.isHomeowner ||
-      body["Are You The Homeowner"] ||
-      body.contact?.isHomeowner ||
-      "";
+    const phoneRaw = body.phone || body.Phone || body.contact?.phone || body.contact?.phoneNumber || body.contact?.phone_number;
+    const name = body.name || body.full_name || body.fullName || body.contact?.name || [body.contact?.firstName, body.contact?.lastName].filter(Boolean).join(" ") || body.contact?.first_name || "there";
+    const email = body.email || body.Email || body.contact?.email || body.contact?.emailAddress || "";
+    const address = body.address || body.Address || body.contact?.address1 || body.contact?.address || "";
+    const postcode = body.postcode || body.postCode || body.Postcode || body.contact?.postalCode || body.contact?.postcode || "";
+    const propertyType = body.propertyType || body["Property Type"] || body.contact?.propertyType || "";
+    const isHomeowner = body.isHomeowner || body["Are You The Homeowner"] || body.contact?.isHomeowner || "";
 
     const preferred_day = body.booking?.preferred_day; // We are now tracking the preferred day
-    console.log('Received preferred_day:', preferred_day); // Log preferred day to check
 
     if (!phoneRaw) {
       return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
@@ -203,7 +159,6 @@ app.post("/ghl/lead", async (req, res) => {
 
     const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-    // Make the call – Twilio will hit /twilio/voice for TwiML
     const call = await client.calls.create({
       to,
       from,
@@ -284,51 +239,31 @@ app.post("/twilio/speech", async (req, res) => {
     return res.type("text/xml").send(twimlEnd);
   }
 
-  // Decide the stage based on the conversation
-  // Example: Ask for preferred day and window, and then send the data to GHL webhook
-
-  // Your logic here...
+  // Stage logic...
+  // Implement your stage transitions as per the workflow
 
   res.status(200).send('OK');
 });
 
-// -------------------- Post to GHL booking webhook --------------------
-async function postToGhlBookingWebhook({ lead, booking, transcript }) {
-  const url = process.env.GHL_BOOKING_TRIGGER_URL;
-  if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
-
+// -------------------- Call status callback --------------------
+app.post("/twilio/status", (req, res) => {
   const payload = {
-    agent: "Nicola",
-    source: "AI_CALL",
-    intent: "BOOK",
-    phone: lead?.phone || "",
-    name: lead?.name || "",
-    email: lead?.email || "",
-    address: lead?.address || "",
-    postcode: lead?.postcode || "",
-    propertyType: lead?.propertyType || "",
-    isHomeowner: lead?.isHomeowner || "",
-    booking: {
-      preferred_day: booking?.preferred_day || "",
-      preferred_window: booking?.preferred_window || "",
-      confirmed_address: booking?.confirmed_address || "",
-      notes: booking?.notes || ""
-    },
-    transcript: transcript.map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`).join("\n")
+    CallSid: req.body.CallSid,
+    CallStatus: req.body.CallStatus,
+    To: req.body.To,
+    From: req.body.From,
+    Duration: req.body.CallDuration,
+    Timestamp: req.body.Timestamp
   };
 
-  const r = await fetchFn(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
+  console.log("Call status:", payload);
 
-  if (!r.ok) {
-    const errText = await r.text().catch(() => "");
-    throw new Error(`GHL webhook failed: ${r.status} ${errText}`);
+  if (payload.CallStatus === "completed") {
+    sessions.delete(payload.CallSid);
   }
-}
 
-// IMPORTANT: listen on Railway port
+  res.status(200).send("ok");
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
