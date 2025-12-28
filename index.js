@@ -193,4 +193,247 @@ app.post("/twilio/speech", async (req, res) => {
     return res.type("text/xml").send(twimlEnd);
   }
 
-  // Get AI reply + intent (BOOK / LATER / NOT_INTERESTE_
+  // Get AI reply + intent (BOOK / LATER / NOT_INTERESTED / CONTINUE)
+  const ai = await getAiTurn({
+    lead: session.lead,
+    transcript: session.transcript
+  });
+
+  session.transcript.push({ role: "assistant", text: ai.reply });
+
+  // If BOOK: post to GHL webhook immediately
+  if (ai.intent === "BOOK") {
+    try {
+      await postToGhlBookingWebhook({
+        lead: session.lead,
+        booking: ai.booking || {},
+        transcript: session.transcript
+      });
+    } catch (e) {
+      console.error("GHL webhook post failed:", e?.message || e);
+      // Still continue the call politely
+    }
+  }
+
+  sessions.set(callSid, session);
+
+  // Decide whether to hang up or continue gathering
+  const shouldHangup = ["BOOKED_DONE", "NOT_INTERESTED", "LATER_DONE"].includes(ai.end_state);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${baseUrl}/tts?text=${encodeURIComponent(ai.reply)}</Play>
+  ${
+    shouldHangup
+      ? "<Hangup/>"
+      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="7"/>`
+  }
+  ${
+    shouldHangup
+      ? ""
+      : `<Play>${baseUrl}/tts?text=${encodeURIComponent("Sorry — I didn’t catch that. Can you say that one more time?")}</Play>`
+  }
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// -------------------- ElevenLabs TTS endpoint (Twilio plays this) --------------------
+app.get("/tts", async (req, res) => {
+  try {
+    const text = String(req.query.text || "").trim();
+    if (!text) return res.status(400).send("Missing text");
+
+    if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
+      return res.status(500).send("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
+    }
+
+    // Keep it sane
+    const safeText = text.slice(0, 600);
+
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+
+    const r = await fetch(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg"
+      },
+      body: JSON.stringify({
+        text: safeText,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: {
+          stability: 0.4,
+          similarity_boost: 0.85
+        }
+      })
+    });
+
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      console.error("ElevenLabs error:", r.status, errText);
+      return res.status(500).send("TTS failed");
+    }
+
+    const audio = Buffer.from(await r.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(audio);
+  } catch (e) {
+    console.error("TTS error:", e);
+    return res.status(500).send("TTS crashed");
+  }
+});
+
+// -------------------- Call status callback --------------------
+app.post("/twilio/status", (req, res) => {
+  const payload = {
+    CallSid: req.body.CallSid,
+    CallStatus: req.body.CallStatus,
+    To: req.body.To,
+    From: req.body.From,
+    Duration: req.body.CallDuration,
+    Timestamp: req.body.Timestamp
+  };
+
+  console.log("Call status:", payload);
+
+  // Cleanup finished calls
+  if (payload.CallStatus === "completed") {
+    sessions.delete(payload.CallSid);
+  }
+
+  res.status(200).send("ok");
+});
+
+// -------------------- AI turn (OpenAI) --------------------
+async function getAiTurn({ lead, transcript }) {
+  if (!process.env.OPENAI_API_KEY) {
+    // Fallback (never block call)
+    return {
+      reply: "Sorry — I’m having a little technical hiccup. I’ll send you a text to get you booked in.",
+      intent: "LATER",
+      end_state: "LATER_DONE"
+    };
+  }
+
+  const system = `
+You are "Nicola", a friendly UK caller for Greenbug Energy.
+Context: You are calling a lead who filled a form requesting a FREE home energy survey about solar panels.
+Goal: Have a natural conversation and book a site survey.
+
+Rules:
+- Sound human, warm, short sentences. UK tone. No robotic scripts.
+- Ask ONE question at a time.
+- Confirm the ADDRESS if missing/unclear. If they already gave it, just confirm postcode.
+- Qualify lightly: homeowner? property type? approx monthly electric bill? roof shading? timeframe to install?
+- If they are busy: offer to book and text details. If not interested: be polite and end.
+- To BOOK: ask for preferred day and whether morning/afternoon. Do NOT promise an exact time. Say you’ll text confirmation.
+- Output MUST be valid JSON only with keys: reply, intent, end_state, booking
+- intent must be one of: CONTINUE, BOOK, LATER, NOT_INTERESTED
+- end_state must be one of: CONTINUE, BOOKED_DONE, LATER_DONE, NOT_INTERESTED
+- booking is an object and may include: preferred_day, preferred_window, notes, confirmed_address
+`;
+
+  const leadSummary = {
+    name: lead?.name || "",
+    phone: lead?.phone || "",
+    email: lead?.email || "",
+    address: lead?.address || "",
+    postcode: lead?.postcode || "",
+    propertyType: lead?.propertyType || "",
+    isHomeowner: lead?.isHomeowner || ""
+  };
+
+  const messages = [
+    { role: "system", content: system.trim() },
+    {
+      role: "user",
+      content: `Lead details from form (may be partial): ${JSON.stringify(leadSummary)}`
+    },
+    ...transcript.slice(-12).map((t) => ({
+      role: t.role === "assistant" ? "assistant" : "user",
+      content: t.text
+    }))
+  ];
+
+  const resp = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      temperature: 0.4,
+      messages
+    })
+  });
+
+  const data = await resp.json();
+  const raw = data?.choices?.[0]?.message?.content || "";
+
+  // Parse JSON safely
+  try {
+    const parsed = JSON.parse(raw);
+    // Hard guardrails
+    if (!parsed.reply) throw new Error("No reply");
+    return {
+      reply: String(parsed.reply),
+      intent: parsed.intent || "CONTINUE",
+      end_state: parsed.end_state || "CONTINUE",
+      booking: parsed.booking || {}
+    };
+  } catch (e) {
+    // If the model outputs non-JSON, recover with a generic prompt
+    return {
+      reply: "Perfect — just a quick one: are you the homeowner at the property?",
+      intent: "CONTINUE",
+      end_state: "CONTINUE",
+      booking: {}
+    };
+  }
+}
+
+// -------------------- Post to GHL inbound webhook trigger --------------------
+async function postToGhlBookingWebhook({ lead, booking, transcript }) {
+  const url = process.env.GHL_BOOKING_TRIGGER_URL;
+  if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
+
+  const payload = {
+    agent: "Nicola",
+    source: "AI_CALL",
+    intent: "BOOK",
+    phone: lead?.phone || "",
+    name: lead?.name || "",
+    email: lead?.email || "",
+    address: lead?.address || "",
+    postcode: lead?.postcode || "",
+    propertyType: lead?.propertyType || "",
+    isHomeowner: lead?.isHomeowner || "",
+    booking: {
+      preferred_day: booking?.preferred_day || "",
+      preferred_window: booking?.preferred_window || "",
+      confirmed_address: booking?.confirmed_address || "",
+      notes: booking?.notes || ""
+    },
+    transcript: transcript.map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`).join("\n")
+  };
+
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  if (!r.ok) {
+    const errText = await r.text().catch(() => "");
+    throw new Error(`GHL webhook failed: ${r.status} ${errText}`);
+  }
+}
+
+// IMPORTANT: listen on Railway port
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
