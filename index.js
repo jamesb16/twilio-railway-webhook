@@ -48,8 +48,7 @@ function isYes(s) {
     t.includes("right") ||
     t.includes("sounds good") ||
     t === "ok" ||
-    t === "okay" ||
-    t.includes("ok")
+    t === "okay"
   );
 }
 
@@ -59,8 +58,8 @@ function isNo(s) {
     t === "no" ||
     t === "nope" ||
     t === "nah" ||
-    t.includes("not really") ||
-    t.includes("no") ||
+    t === "not really" ||
+    (t.includes("no") && !t.includes("know")) ||
     t.includes("not") ||
     t.includes("wrong") ||
     t.includes("incorrect")
@@ -71,7 +70,7 @@ function extractWindow(s) {
   const t = norm(s);
   if (t.includes("morning") || t.includes("am") || t.includes("a.m")) return "Morning";
   if (t.includes("afternoon") || t.includes("pm") || t.includes("p.m")) return "Afternoon";
-  if (t.includes("evening")) return "Evening"; // you said no evening, but keep for safety
+  if (t.includes("evening")) return "Evening"; // you said no evening; we won’t offer it, but we can parse it.
   return "";
 }
 
@@ -96,7 +95,6 @@ function extractDay(s) {
 
   if (t.includes("tomorrow")) return "Tomorrow";
   if (t.includes("next week")) return "Next week";
-
   return "";
 }
 
@@ -104,7 +102,6 @@ function pick(arr) {
   return arr[Math.floor(Math.random() * arr.length)];
 }
 
-// ✅ IMPORTANT: correct helper name (this is what broke earlier)
 function ttsUrl(baseUrl, text) {
   return `${baseUrl}/tts?text=${encodeURIComponent(text)}`;
 }
@@ -117,124 +114,103 @@ function ensureSession(callSid) {
       turns: 0,
       stage: "OPEN",
       retries: { confirmAddress: 0, askDay: 0, askWindow: 0 },
-      booking: {
-        preferred_day: "",
-        preferred_window: "",
-        confirmed_address: "",
-        notes: "",
-        start_datetime: ""
-      }
+      booking: { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "", start_datetime: "" }
     });
   }
   return sessions.get(callSid);
 }
 
-// -------------------- Calendar helper --------------------
-// Goal:
-// - Mon–Fri only
-// - Morning slots: 09:00 or 10:30 (90 mins each)
-// - Afternoon slots: 13:00 or 14:30 (90 mins each)
-// - Output format: "YYYY-MM-DD HH:MM" in Europe/London
+// -------------------- Calendar slot rules (Mon–Fri only, 2 morning + 2 afternoon) --------------------
+// We’ll convert “preferred_day” + “Morning/Afternoon” into a REAL datetime string
+// in a format GHL accepts: "DD-MMM-YYYY HH:MM AM"
+const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
-function formatInLondon(dateObj) {
-  const parts = new Intl.DateTimeFormat("en-GB", {
-    timeZone: "Europe/London",
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false
-  }).formatToParts(dateObj);
+// Format: DD-MMM-YYYY HH:MM AM/PM
+function formatGhlDate(d) {
+  const dd = pad2(d.getDate());
+  const mmm = MONTHS[d.getMonth()];
+  const yyyy = d.getFullYear();
 
-  const get = (type) => parts.find((p) => p.type === type)?.value;
+  let hours = d.getHours();
+  const minutes = pad2(d.getMinutes());
+  const ampm = hours >= 12 ? "PM" : "AM";
+  hours = hours % 12;
+  if (hours === 0) hours = 12;
 
-  // en-GB gives DD/MM/YYYY, but we build our own parts:
-  const yyyy = get("year");
-  const mm = get("month");
-  const dd = get("day");
-  const hh = get("hour");
-  const mi = get("minute");
-
-  return `${yyyy}-${mm}-${dd} ${hh}:${mi}`;
+  return `${dd}-${mmm}-${yyyy} ${pad2(hours)}:${minutes} ${ampm}`;
 }
 
-function nextWeekdayDate(fromDate, targetDow) {
-  // targetDow: 1=Mon ... 5=Fri (JS: 0=Sun)
-  const d = new Date(fromDate);
-  const current = d.getDay();
-  let add = (targetDow - current + 7) % 7;
-  if (add === 0) add = 7; // next occurrence, not today
-  d.setDate(d.getDate() + add);
-  return d;
+function isWeekend(dateObj) {
+  const day = dateObj.getDay(); // 0 Sun ... 6 Sat
+  return day === 0 || day === 6;
 }
 
-function clampToMonFri(d) {
-  // If Sat(6) -> move to Mon(+2), Sun(0) -> move to Mon(+1)
-  const day = d.getDay();
-  if (day === 6) d.setDate(d.getDate() + 2);
-  if (day === 0) d.setDate(d.getDate() + 1);
-  return d;
+// Choose a deterministic start time (keeps it simple + avoids “random” double-book confusion):
+// Morning => 10:00 AM
+// Afternoon => 2:00 PM
+function windowStartHour(win) {
+  if (win === "Afternoon") return 14;
+  return 10; // Morning default
 }
 
-function slotTimesForWindow(win) {
-  if (win === "Morning") return [{ h: 9, m: 0 }, { h: 10, m: 30 }];
-  if (win === "Afternoon") return [{ h: 13, m: 0 }, { h: 14, m: 30 }];
-  // no evenings in your rules; fallback to morning
-  return [{ h: 9, m: 0 }, { h: 10, m: 30 }];
-}
-
-function pickSlotIndex(stableKey) {
-  // stable “random”: pick slot 0 or 1 based on callSid hash-ish
-  const s = String(stableKey || "");
-  let sum = 0;
-  for (let i = 0; i < s.length; i++) sum += s.charCodeAt(i);
-  return sum % 2;
-}
-
-function computeStartDateTime(preferredDay, preferredWindow, stableKey) {
-  const day = String(preferredDay || "").trim();
-  const win = String(preferredWindow || "").trim();
-
+// Convert preferred day label into the next matching weekday (Mon–Fri)
+function nextDateForPreferredDay(preferredDay) {
   const now = new Date();
-  let targetDate = new Date(now);
+  const d = new Date(now);
+  d.setSeconds(0, 0);
 
-  const weekdayMap = {
-    Monday: 1,
-    Tuesday: 2,
-    Wednesday: 3,
-    Thursday: 4,
-    Friday: 5
-  };
-
-  if (day === "Tomorrow") {
-    targetDate.setDate(targetDate.getDate() + 1);
-    targetDate = clampToMonFri(targetDate);
-  } else if (day === "Next week") {
-    // Next Monday
-    targetDate = nextWeekdayDate(targetDate, 1);
-    targetDate.setDate(targetDate.getDate() + 7);
-  } else if (weekdayMap[day]) {
-    targetDate = nextWeekdayDate(targetDate, weekdayMap[day]);
-  } else {
-    // If they said Sat/Sun or something weird, push to next weekday
-    targetDate.setDate(targetDate.getDate() + 1);
-    targetDate = clampToMonFri(targetDate);
+  // Tomorrow
+  if (preferredDay === "Tomorrow") {
+    d.setDate(d.getDate() + 1);
+    return d;
   }
 
-  // If they chose Saturday/Sunday, force Monday
-  targetDate = clampToMonFri(targetDate);
+  // Next week => next Monday
+  if (preferredDay === "Next week") {
+    // move to next Monday, then +7 to guarantee "next week"
+    const target = 1; // Monday
+    const current = d.getDay();
+    let add = (target - current + 7) % 7;
+    if (add === 0) add = 7;
+    add += 7;
+    d.setDate(d.getDate() + add);
+    return d;
+  }
 
-  const slots = slotTimesForWindow(win);
-  const idx = pickSlotIndex(stableKey);
-  const chosen = slots[idx] || slots[0];
+  const week = { Sunday:0, Monday:1, Tuesday:2, Wednesday:3, Thursday:4, Friday:5, Saturday:6 };
+  if (week[preferredDay] !== undefined) {
+    const target = week[preferredDay];
+    const current = d.getDay();
+    let add = (target - current + 7) % 7;
+    if (add === 0) add = 7; // next occurrence (not today)
+    d.setDate(d.getDate() + add);
+    return d;
+  }
 
-  targetDate.setHours(chosen.h, chosen.m, 0, 0);
-  return formatInLondon(targetDate);
+  // fallback: next weekday
+  d.setDate(d.getDate() + 1);
+  return d;
+}
+
+// Enforce Mon–Fri only. If chosen date lands weekend, push to Monday.
+function forceWeekday(d) {
+  while (isWeekend(d)) d.setDate(d.getDate() + 1);
+  return d;
+}
+
+function computeStartDateTime(preferredDay, preferredWindow) {
+  let d = nextDateForPreferredDay(String(preferredDay || "").trim());
+  d = forceWeekday(d);
+
+  const win = String(preferredWindow || "").trim();
+  const hour = windowStartHour(win);
+
+  d.setHours(hour, 0, 0, 0);
+  return formatGhlDate(d);
 }
 
 // -------------------- Health --------------------
@@ -394,6 +370,7 @@ app.post("/twilio/speech", async (req, res) => {
 
   console.log("Speech:", { callSid, speech, confidence, stage: session.stage });
 
+  // Safety stop
   if (session.turns >= 14) {
     session.stage = "DONE";
     sessions.set(callSid, session);
@@ -412,8 +389,7 @@ app.post("/twilio/speech", async (req, res) => {
     "Mm-hmm… one sec.",
     "Okay… just checking that.",
     "Perfect… just a moment.",
-    "Right… bear with me a sec.",
-    "System’s being a bit slow… one moment."
+    "Right… bear with me a sec."
   ]);
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -456,7 +432,7 @@ app.post("/twilio/next", async (req, res) => {
     }
   }
 
-  // CONFIRM_ADDRESS (confirm what’s on the form; don’t re-ask full address)
+  // CONFIRM_ADDRESS (confirm what we already have, don’t re-ask the whole thing)
   if (session.stage === "CONFIRM_ADDRESS") {
     const hasAddress = !!norm(session.lead.address);
     const hasPostcode = !!norm(session.lead.postcode);
@@ -476,7 +452,7 @@ app.post("/twilio/next", async (req, res) => {
           session.retries.confirmAddress++;
           session.booking.notes = (session.booking.notes || "") + " Address mismatch reported.";
         } else {
-          // treat postcode-like input as postcode
+          // Treat postcode-like answer as postcode
           const maybe = lastUser.trim();
           if (maybe.length >= 5 && /[a-z]/i.test(maybe) && /\d/.test(maybe)) {
             session.lead.postcode = maybe;
@@ -518,10 +494,10 @@ app.post("/twilio/next", async (req, res) => {
 
     if (!day) {
       if (session.retries.askDay === 0) {
-        reply = "Lovely. What day suits you best for the survey? We do Monday to Friday.";
+        reply = "Lovely. What day suits you best for the survey? Monday to Friday.";
         session.retries.askDay++;
       } else {
-        reply = "No worries — is that more like Monday, Tuesday, or later in the week?";
+        reply = "No worries — is that more like Monday, Tuesday, or later in the week? Monday to Friday only.";
         session.retries.askDay++;
       }
 
@@ -531,9 +507,9 @@ app.post("/twilio/next", async (req, res) => {
         session.stage = "DONE";
       }
     } else {
-      // If they said Sat/Sun, push back to weekday
+      // If weekend mentioned, re-prompt
       if (day === "Saturday" || day === "Sunday") {
-        reply = "We’re Monday to Friday for surveys — which weekday would suit you best?";
+        reply = "We’re Monday to Friday for surveys — which weekday suits best?";
         session.retries.askDay++;
       } else {
         session.booking.preferred_day = day;
@@ -546,7 +522,7 @@ app.post("/twilio/next", async (req, res) => {
   if (session.stage === "ASK_WINDOW") {
     const win = extractWindow(lastUser);
 
-    if (!win) {
+    if (!win || win === "Evening") {
       if (session.retries.askWindow === 0) {
         reply = "Great — would you prefer morning or afternoon?";
         session.retries.askWindow++;
@@ -560,24 +536,20 @@ app.post("/twilio/next", async (req, res) => {
         shouldHangup = true;
         session.stage = "DONE";
       }
-    } else if (win === "Evening") {
-      reply = "We don’t do evenings for surveys — would morning or afternoon suit better?";
-      session.retries.askWindow++;
     } else {
       session.booking.preferred_window = win;
 
-      // ✅ compute actual datetime for GHL booking
+      // ✅ GHL needs an actual datetime in accepted format
       session.booking.start_datetime = computeStartDateTime(
         session.booking.preferred_day,
-        session.booking.preferred_window,
-        callSid
+        session.booking.preferred_window
       );
 
       session.stage = "CONFIRM_CLOSE";
     }
   }
 
-  // CONFIRM_CLOSE -> post to GHL
+  // CONFIRM_CLOSE -> post to GHL webhook once and end
   if (session.stage === "CONFIRM_CLOSE") {
     try {
       await postToGhlBookingWebhook({
@@ -595,7 +567,7 @@ app.post("/twilio/next", async (req, res) => {
   }
 
   // fallback replies
-  if (!reply && session.stage === "ASK_DAY") reply = "What day suits you best for the survey? Monday to Friday.";
+  if (!reply && session.stage === "ASK_DAY") reply = "What weekday suits you best for the survey? Monday to Friday.";
   if (!reply && session.stage === "ASK_WINDOW") reply = "Morning or afternoon work better?";
   if (!reply && session.stage === "CONFIRM_ADDRESS") {
     const addrLine = [session.lead.address, session.lead.postcode].filter(Boolean).join(", ");
@@ -692,11 +664,12 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
   const url = process.env.GHL_BOOKING_TRIGGER_URL;
   if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
 
-  // ✅ IMPORTANT: match your workflow mapping: inboundWebhookRequest.lead.xxx and inboundWebhookRequest.booking.xxx
+  // ✅ IMPORTANT: wrap in {lead:{...}} so your GHL mappings inboundWebhookRequest.lead.xxx work
   const payload = {
     agent: "Nicola",
     source: "AI_CALL",
     intent: "BOOK",
+
     lead: {
       phone: lead?.phone || "",
       name: lead?.name || "",
@@ -706,17 +679,20 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
       propertyType: lead?.propertyType || "",
       isHomeowner: lead?.isHomeowner || ""
     },
+
     booking: {
       preferred_day: booking?.preferred_day || "",
       preferred_window: booking?.preferred_window || "",
       confirmed_address: booking?.confirmed_address || "",
       notes: booking?.notes || "",
-      start_datetime: booking?.start_datetime || "" // ✅ used by Book Appointment
+      // ✅ what Book Appointment should map to:
+      start_datetime: booking?.start_datetime || ""
     },
-    transcript: transcript.map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`).join("\n")
-  };
 
-  console.log("Posting booking payload to GHL:", payload.booking, payload.lead);
+    transcript: transcript
+      .map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`)
+      .join("\n")
+  };
 
   const r = await fetchFn(url, {
     method: "POST",
