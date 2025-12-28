@@ -1,218 +1,153 @@
 const express = require("express");
 const twilio = require("twilio");
-
+const axios = require("axios");
 const app = express();
 
-// GHL often sends JSON; Twilio webhooks are x-www-form-urlencoded
+// Middleware to parse incoming requests
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 
-// ---------- Health ----------
-app.get("/", (req, res) => res.status(200).send("OK - Railway Node server is running"));
-app.get("/health", (req, res) => res.status(200).json({ ok: true }));
+// Eleven Labs API credentials
+const ELEVEN_LABS_API_KEY = 'your-eleven-labs-api-key'; // Replace with your Eleven Labs API key
+const ELEVEN_LABS_VOICE_ID = 'your-voice-id'; // Replace with the cloned voice ID for Nicola
 
-// ---------- Outbound call trigger from GHL ----------
+// Twilio credentials (for creating the call)
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
+const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // Your public URL for the app
+
+// Endpoint to trigger outbound call from GHL webhook
 app.post("/ghl/lead", async (req, res) => {
   try {
-    const body = req.body || {};
-    const phoneRaw =
-      body.phone ||
-      body.Phone ||
-      body.contact?.phone ||
-      body.contact?.phoneNumber ||
-      body.contact?.phone_number;
+    const { name, phone, email, address, preferred_day, preferred_window, homeowner } = req.body;
+    
+    console.log(`Received lead: ${name}, ${phone}, ${email}, ${address}, Preferred Day: ${preferred_day}, Preferred Window: ${preferred_window}, Homeowner: ${homeowner}`);
 
-    const name =
-      body.name ||
-      body.full_name ||
-      body.fullName ||
-      body.contact?.name ||
-      body.contact?.firstName ||
-      body.contact?.first_name ||
-      "there";
-
-    const email =
-      body.email ||
-      body.Email ||
-      body.contact?.email ||
-      body.contact?.emailAddress ||
-      "";
-
-    const address =
-      body.address ||
-      body.Address ||
-      body.contact?.address1 ||
-      body.contact?.address ||
-      "";
-
-    const postcode =
-      body.postcode ||
-      body.postCode ||
-      body.Postcode ||
-      body.contact?.postalCode ||
-      body.contact?.postcode ||
-      "";
-
-    const propertyType =
-      body.propertyType ||
-      body["Property Type"] ||
-      body.contact?.propertyType ||
-      "";
-
-    const isHomeowner =
-      body.isHomeowner ||
-      body["Are You The Homeowner"] ||
-      body.contact?.isHomeowner ||
-      "";
-
-    if (!phoneRaw) {
-      return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
-    }
-
-    const to = String(phoneRaw).trim();
-    const from = process.env.TWILIO_FROM_NUMBER;
-
-    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !from) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER env vars"
-      });
-    }
-
-    const baseUrl = process.env.PUBLIC_BASE_URL;
-    if (!baseUrl) {
-      return res.status(500).json({
-        ok: false,
-        error: "Missing PUBLIC_BASE_URL env var (your Railway public URL)"
-      });
-    }
-
-    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
+    // Make a call using Twilio if homeowner status is "Yes"
+    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
     const call = await client.calls.create({
-      to,
-      from,
-      // Twilio will request TwiML from here when the call connects
-      url: `${baseUrl}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(
-        to
-      )}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(
-        address
-      )}&postcode=${encodeURIComponent(postcode)}&propertyType=${encodeURIComponent(
-        propertyType
-      )}&isHomeowner=${encodeURIComponent(isHomeowner)}`,
+      to: phone,
+      from: TWILIO_FROM_NUMBER,
+      url: `${PUBLIC_BASE_URL}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&homeowner=${encodeURIComponent(homeowner)}&preferred_day=${encodeURIComponent(preferred_day)}&preferred_window=${encodeURIComponent(preferred_window)}`,
       method: "POST",
-
-      statusCallback: `${baseUrl}/twilio/status`,
+      statusCallback: `${PUBLIC_BASE_URL}/twilio/status`,
       statusCallbackMethod: "POST",
       statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
     });
 
-    return res.status(200).json({
-      ok: true,
-      message: "Call triggered",
-      sid: call.sid,
-      to,
-      name
-    });
-  } catch (err) {
-    console.error("Error in /ghl/lead:", err);
-    return res.status(500).json({ ok: false, error: err.message || "Unknown error" });
+    res.status(200).json({ status: 'success', message: 'Call triggered', sid: call.sid });
+  } catch (error) {
+    console.error('Error in /ghl/lead:', error);
+    res.status(500).json({ error: error.message || 'Error processing lead' });
   }
 });
 
-// ---------- What the call says (TwiML) ----------
+// Endpoint to handle the Twilio call response (Voice Interaction)
 app.post("/twilio/voice", async (req, res) => {
-  const baseUrl = process.env.PUBLIC_BASE_URL;
-  const name = (req.query.name || "there").toString();
-  const phone = (req.query.phone || "").toString();
-  const email = (req.query.email || "").toString();
-  const address = (req.query.address || "").toString();
-  const postcode = (req.query.postcode || "").toString();
-  const propertyType = (req.query.propertyType || "").toString();
-  const isHomeowner = (req.query.isHomeowner || "").toString(); // Get homeowner info from form
+  try {
+    const { name, phone, homeowner, preferred_day, preferred_window } = req.query;
 
-  const callSid = req.body.CallSid || req.query.CallSid || "";
+    let message = `Hi ${name}, it’s Nicola from Greenbug Energy. You requested a callback about your home energy survey.`;
 
-  // Create / reset session
-  sessions.set(callSid, {
-    lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
-    transcript: [{ role: "assistant", text: "Call started." }],
-    turns: 0
-  });
+    // If homeowner info is provided, skip the question
+    if (homeowner === "Yes") {
+      message += " Thank you for confirming that you are the homeowner.";
+    } else {
+      message += " Can you confirm if you are the homeowner?";
+    }
 
-  let twiml = `<?xml version="1.0" encoding="UTF-8"?>
-  <Response>
-    <Say voice="alice" loop="false">Hi ${escapeXml(name)}. It’s Greenbug Energy. You requested a callback about a site survey.</Say>`;
+    // Generate voice using Eleven Labs
+    const audioUrl = await sendElevenLabsMessage(message);
 
-  // Skip asking homeowner question if already answered in the form
-  if (isHomeowner === "Yes") {
-    twiml += `<Say voice="alice" loop="false">Thank you for confirming. We will proceed with your survey booking.</Say>`;
-    twiml += `<Gather input="speech" action="/twilio/speech" method="POST" speechTimeout="auto" timeout="2" maxSpeechTime="3"/>`; // Timeout reduced
-  } else {
-    twiml += `<Say voice="alice" loop="false">Can you confirm if you are the homeowner?</Say>`;
-    twiml += `<Gather input="speech" action="/twilio/speech" method="POST" speechTimeout="auto" timeout="2" maxSpeechTime="3"/>`; // Timeout reduced
+    // Create Twilio Voice Response
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.play(audioUrl); // Play the generated voice
+
+    // Send response to Twilio
+    res.type('text/xml');
+    res.send(twiml.toString());
+  } catch (error) {
+    console.error('Error in /twilio/voice:', error);
+    res.status(500).send('Internal Server Error');
   }
-
-  twiml += `<Say voice="alice" loop="false">Sorry, I didn't catch that. We’ll send you a text to rebook. Goodbye.</Say>
-  </Response>`;
-
-  res.type("text/xml").send(twiml);
 });
 
-// ---------- Capture speech result ----------
+// Function to call Eleven Labs API to generate voice response
+const sendElevenLabsMessage = async (text) => {
+  try {
+    const response = await axios.post('https://api.elevenlabs.io/v1/text-to-speech', {
+      voice_id: ELEVEN_LABS_VOICE_ID,
+      text: text,
+      voice_settings: { speed: 1.0, pitch: 1.0 },
+    }, {
+      headers: {
+        'Authorization': `Bearer ${ELEVEN_LABS_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+    });
+
+    console.log('Eleven Labs voice response:', response.data);
+    return response.data.audio_url; // This will be the URL of the generated audio file
+  } catch (error) {
+    console.error('Error generating voice message from Eleven Labs:', error);
+    throw new Error('Failed to generate voice message');
+  }
+};
+
+// Endpoint to capture the result of the speech input
 app.post("/twilio/speech", (req, res) => {
-  const speech = (req.body.SpeechResult || "").toLowerCase();
-  const confidence = req.body.Confidence;
+  try {
+    const speech = (req.body.SpeechResult || "").toLowerCase();
+    const confidence = req.body.Confidence;
 
-  console.log("SpeechResult:", { speech, confidence });
+    let reply = "Sorry, I didn’t catch that. Can you repeat?";
+    if (speech.includes("yes")) {
+      reply = "Thank you! We will proceed with your survey booking.";
+    } else if (speech.includes("no")) {
+      reply = "Alright, let us know when you're ready.";
+    }
 
-  let reply = "Sorry, I didn't catch that. Can you say that again?";
-  if (speech.includes("yes")) {
-    reply = "Thank you! We will proceed with the survey.";
-  } else if (speech.includes("no")) {
-    reply = "Alright, please let us know when you're ready for the survey.";
+    // Respond with the appropriate message
+    const twiml = new twilio.twiml.VoiceResponse();
+    twiml.say(reply);
+    twiml.hangup();
+
+    res.type('text/xml');
+    res.send(twiml.toString());
+  } catch (error) {
+    console.error('Error processing speech:', error);
+    res.status(500).send('Internal Server Error');
   }
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="alice" loop="false">${escapeXml(reply)}</Say>
-  <Hangup/>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
 });
 
-// ---------- Capture call status callback ----------
+// Endpoint for status callback (used to track call status)
 app.post("/twilio/status", (req, res) => {
-  const payload = {
-    CallSid: req.body.CallSid,
-    CallStatus: req.body.CallStatus,
-    To: req.body.To,
-    From: req.body.From,
-    Duration: req.body.CallDuration,
-    Timestamp: req.body.Timestamp
-  };
+  try {
+    const payload = {
+      CallSid: req.body.CallSid,
+      CallStatus: req.body.CallStatus,
+      To: req.body.To,
+      From: req.body.From,
+      Duration: req.body.CallDuration,
+      Timestamp: req.body.Timestamp,
+    };
 
-  console.log("Call status:", payload);
-
-  // Cleanup finished calls
-  if (payload.CallStatus === "completed") {
-    sessions.delete(payload.CallSid);
+    console.log('Call status update:', payload);
+    res.status(200).send('ok');
+  } catch (error) {
+    console.error('Error handling status callback:', error);
+    res.status(500).send('Internal Server Error');
   }
-
-  res.status(200).send("ok");
 });
 
-// ---------- Helpers ----------
-function escapeXml(unsafe) {
-  return unsafe
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&apos;");
-}
+// Health check route to confirm the server is running
+app.get('/', (req, res) => {
+  res.status(200).send('OK - Server is running');
+});
 
-// IMPORTANT: listen on Railway port
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
+// Start the server
+const port = process.env.PORT || 3000;
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
+});
