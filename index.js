@@ -7,9 +7,6 @@ const app = express();
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
 
-// In-memory call sessions (simple + effective)
-const sessions = new Map();
-
 // Eleven Labs API credentials
 const ELEVEN_LABS_API_KEY = 'your-eleven-labs-api-key'; // Replace with your Eleven Labs API key
 const ELEVEN_LABS_VOICE_ID = 'your-voice-id'; // Replace with the cloned voice ID for Nicola
