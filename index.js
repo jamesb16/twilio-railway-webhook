@@ -7,34 +7,108 @@ const app = express();
 app.use(express.json({ limit: "1mb" }));
 app.use(express.urlencoded({ extended: false }));
 
-// In-memory session storage
+/**
+ * sessions[CallSid] = {
+ *   lead: { name, phone, email, address, postcode, propertyType, isHomeowner },
+ *   transcript: [{ role: "assistant"|"user", text }],
+ *   turns: number,
+ *   stage: "OPEN"|"CONFIRM_ADDRESS"|"ASK_DAY"|"ASK_WINDOW"|"CONFIRM_CLOSE"|"DONE",
+ *   retries: { confirmAddress: number, askDay: number, askWindow: number },
+ *   booking: { preferred_day, preferred_window, confirmed_address, notes, start_datetime }
+ * }
+ */
 const sessions = new Map();
 
-const fetchFn = global.fetch || ((...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args)));
+// Use fetch safely on Railway
+const fetchFn =
+  global.fetch ||
+  ((...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args)));
 
-// Helper function to normalize speech input
+// -------------------- Helpers: speech normalization --------------------
 function norm(s) {
   return String(s || "").trim().toLowerCase();
+}
+
+function isYes(s) {
+  const t = norm(s);
+  return (
+    t === "yes" ||
+    t === "yeah" ||
+    t === "yeh" ||
+    t === "yep" ||
+    t === "aye" ||
+    t === "yup" ||
+    t.includes("yes") ||
+    t.includes("yeah") ||
+    t.includes("yeh") ||
+    t.includes("aye") ||
+    t.includes("correct") ||
+    t.includes("that's right") ||
+    t.includes("thats right") ||
+    t.includes("right") ||
+    t.includes("sounds good") ||
+    t.includes("ok") ||
+    t.includes("okay")
+  );
+}
+
+function isNo(s) {
+  const t = norm(s);
+  return (
+    t === "no" ||
+    t === "nope" ||
+    t === "nah" ||
+    t === "not really" ||
+    t.includes("no") ||
+    t.includes("not") ||
+    t.includes("wrong") ||
+    t.includes("incorrect")
+  );
 }
 
 function extractWindow(s) {
   const t = norm(s);
   if (t.includes("morning") || t.includes("am") || t.includes("a.m")) return "Morning";
   if (t.includes("afternoon") || t.includes("pm") || t.includes("p.m")) return "Afternoon";
+  if (t.includes("evening")) return "Evening"; // optional
   return "";
 }
 
 function extractDay(s) {
   const t = norm(s);
-  if (t.includes("monday")) return "Monday";
-  if (t.includes("tuesday")) return "Tuesday";
-  if (t.includes("wednesday")) return "Wednesday";
-  if (t.includes("thursday")) return "Thursday";
-  if (t.includes("friday")) return "Friday";
+
+  // allow combos like "monday morning"
+  const map = [
+    { keys: ["monday", "mon"], value: "Monday" },
+    { keys: ["tuesday", "tue", "tues"], value: "Tuesday" },
+    { keys: ["wednesday", "wed"], value: "Wednesday" },
+    { keys: ["thursday", "thu", "thur", "thurs"], value: "Thursday" },
+    { keys: ["friday", "fri"], value: "Friday" },
+    { keys: ["saturday", "sat"], value: "Saturday" },
+    { keys: ["sunday", "sun"], value: "Sunday" }
+  ];
+
+  for (const item of map) {
+    for (const k of item.keys) {
+      if (t.includes(k)) return item.value;
+    }
+  }
+
+  if (t.includes("tomorrow")) return "Tomorrow";
+  if (t.includes("next week")) return "Next week";
+
   return "";
 }
 
-// Ensure session exists
+function pick(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
+
+// IMPORTANT: this is the correct helper name (camelCase)
+function ttsUrl(baseUrl, text) {
+  return `${baseUrl}/tts?text=${encodeURIComponent(text)}`;
+}
+
 function ensureSession(callSid) {
   if (!sessions.has(callSid)) {
     sessions.set(callSid, {
@@ -43,30 +117,149 @@ function ensureSession(callSid) {
       turns: 0,
       stage: "OPEN",
       retries: { confirmAddress: 0, askDay: 0, askWindow: 0 },
-      booking: { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "" }
+      booking: {
+        preferred_day: "",
+        preferred_window: "",
+        confirmed_address: "",
+        notes: "",
+        start_datetime: ""
+      }
     });
   }
   return sessions.get(callSid);
 }
 
-// Health check routes
+// -------------------- Calendar helper (convert preferred day/window -> real datetime) --------------------
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+// Returns "YYYY-MM-DD HH:MM" in UK local time (good enough for GHL)
+function computeStartDateTime(preferredDay, preferredWindow) {
+  const day = String(preferredDay || "").trim();
+  const win = String(preferredWindow || "").trim();
+
+  // pick a sensible slot
+  const hour =
+    win === "Morning" ? 10 : win === "Afternoon" ? 14 : win === "Evening" ? 18 : 10;
+  const minute = 0;
+
+  const now = new Date();
+
+  function format(d) {
+    return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())} ${pad2(
+      d.getHours()
+    )}:${pad2(d.getMinutes())}`;
+  }
+
+  // Tomorrow
+  if (day === "Tomorrow") {
+    const d = new Date(now);
+    d.setDate(d.getDate() + 1);
+    d.setHours(hour, minute, 0, 0);
+    return format(d);
+  }
+
+  // Next week: choose next Monday
+  if (day === "Next week") {
+    const d = new Date(now);
+    const target = 1; // Monday (0=Sun)
+    const current = d.getDay();
+    let add = (target - current + 7) % 7;
+    if (add === 0) add = 7;
+    add += 7; // ensure it's next week
+    d.setDate(d.getDate() + add);
+    d.setHours(hour, minute, 0, 0);
+    return format(d);
+  }
+
+  // Named weekday
+  const week = {
+    Sunday: 0,
+    Monday: 1,
+    Tuesday: 2,
+    Wednesday: 3,
+    Thursday: 4,
+    Friday: 5,
+    Saturday: 6
+  };
+
+  if (week[day] !== undefined) {
+    const d = new Date(now);
+    const target = week[day];
+    const current = d.getDay();
+    let add = (target - current + 7) % 7;
+    if (add === 0) add = 7; // next occurrence, not today
+    d.setDate(d.getDate() + add);
+    d.setHours(hour, minute, 0, 0);
+    return format(d);
+  }
+
+  // fallback: tomorrow at 10
+  const d = new Date(now);
+  d.setDate(d.getDate() + 1);
+  d.setHours(10, 0, 0, 0);
+  return format(d);
+}
+
+// -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK - Greenbug outbound AI is running"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
 
-// Trigger outbound call from GHL
+// -------------------- Trigger outbound call from GHL --------------------
 app.post("/ghl/lead", async (req, res) => {
   try {
     const body = req.body || {};
 
-    const phoneRaw = body.phone || body.Phone || body.contact?.phone;
-    const name = body.name || body.full_name || body.contact?.name || "there";
-    const email = body.email || body.Email || body.contact?.email || "";
-    const address = body.address || body.Address || body.contact?.address1 || "";
-    const postcode = body.postcode || body.contact?.postalCode || "";
-    const propertyType = body.propertyType || body.contact?.propertyType || "";
-    const isHomeowner = body.isHomeowner || body.contact?.isHomeowner || "";
+    const phoneRaw =
+      body.phone ||
+      body.Phone ||
+      body.contact?.phone ||
+      body.contact?.phoneNumber ||
+      body.contact?.phone_number;
 
-    const preferred_day = body.booking?.preferred_day; // Capturing preferred day for calendar booking
+    const name =
+      body.name ||
+      body.full_name ||
+      body.fullName ||
+      body.contact?.name ||
+      [body.contact?.firstName, body.contact?.lastName].filter(Boolean).join(" ") ||
+      body.contact?.first_name ||
+      "there";
+
+    const email =
+      body.email ||
+      body.Email ||
+      body.contact?.email ||
+      body.contact?.emailAddress ||
+      "";
+
+    const address =
+      body.address ||
+      body.Address ||
+      body.contact?.address1 ||
+      body.contact?.address ||
+      "";
+
+    const postcode =
+      body.postcode ||
+      body.postCode ||
+      body.Postcode ||
+      body.contact?.postalCode ||
+      body.contact?.postcode ||
+      "";
+
+    const propertyType =
+      body.propertyType ||
+      body["Property Type"] ||
+      body.contact?.propertyType ||
+      "";
+
+    const isHomeowner =
+      body.isHomeowner ||
+      body["Are You The Homeowner"] ||
+      body.contact?.isHomeowner ||
+      "";
 
     if (!phoneRaw) {
       return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
@@ -95,7 +288,13 @@ app.post("/ghl/lead", async (req, res) => {
     const call = await client.calls.create({
       to,
       from,
-      url: `${baseUrl}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(to)}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}&postcode=${encodeURIComponent(postcode)}&propertyType=${encodeURIComponent(propertyType)}&isHomeowner=${encodeURIComponent(isHomeowner)}&preferred_day=${encodeURIComponent(preferred_day)}`,
+      url: `${baseUrl}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(
+        to
+      )}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(
+        address
+      )}&postcode=${encodeURIComponent(postcode)}&propertyType=${encodeURIComponent(
+        propertyType
+      )}&isHomeowner=${encodeURIComponent(isHomeowner)}`,
       method: "POST",
       statusCallback: `${baseUrl}/twilio/status`,
       statusCallbackMethod: "POST",
@@ -109,8 +308,350 @@ app.post("/ghl/lead", async (req, res) => {
   }
 });
 
-// -------------------- Calendar booking (add this) --------------------
-async function postToCalendarBooking({ lead, booking }) {
+// -------------------- Twilio: first prompt (TwiML) --------------------
+app.post("/twilio/voice", async (req, res) => {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+
+  const name = (req.query.name || "there").toString();
+  const phone = (req.query.phone || "").toString();
+  const email = (req.query.email || "").toString();
+  const address = (req.query.address || "").toString();
+  const postcode = (req.query.postcode || "").toString();
+  const propertyType = (req.query.propertyType || "").toString();
+  const isHomeowner = (req.query.isHomeowner || "").toString();
+
+  const callSid = req.body.CallSid || req.query.CallSid || "";
+
+  const session = ensureSession(callSid);
+  session.lead = { name, phone, email, address, postcode, propertyType, isHomeowner };
+  session.transcript = [{ role: "assistant", text: "Call started." }];
+  session.turns = 0;
+  session.stage = "OPEN";
+  session.retries = { confirmAddress: 0, askDay: 0, askWindow: 0 };
+  session.booking = {
+    preferred_day: "",
+    preferred_window: "",
+    confirmed_address: "",
+    notes: "",
+    start_datetime: ""
+  };
+
+  sessions.set(callSid, session);
+
+  const opening = `Hi ${name}. It’s Nicola from Greenbug Energy. You requested a free home energy survey about solar panels — have I caught you at an okay time?`;
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, opening)}</Play>
+  <Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="6"/>
+  <Play>${ttsUrl(baseUrl, "No worries — I’ll send you a text and you can pick a time that suits. Bye for now.")}</Play>
+  <Hangup/>
+</Response>`;
+
+  res.type("text/xml").send(twiml);
+});
+
+// -------------------- Twilio: speech capture (FAST response with filler) --------------------
+app.post("/twilio/speech", async (req, res) => {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+  const callSid = req.body.CallSid;
+  const speech = (req.body.SpeechResult || "").trim();
+  const confidence = req.body.Confidence;
+
+  const session = ensureSession(callSid);
+  session.turns = (session.turns || 0) + 1;
+
+  if (speech) session.transcript.push({ role: "user", text: speech });
+
+  console.log("Speech:", { callSid, speech, confidence, stage: session.stage });
+
+  // Safety stop
+  if (session.turns >= 14) {
+    session.stage = "DONE";
+    sessions.set(callSid, session);
+    const bye = "Thanks for that — I’ll send you a quick text and we can take it from there. Bye for now.";
+    const twimlEnd = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, bye)}</Play>
+  <Hangup/>
+</Response>`;
+    return res.type("text/xml").send(twimlEnd);
+  }
+
+  sessions.set(callSid, session);
+
+  const filler = pick([
+    "Mm-hmm… one sec.",
+    "Okay… just checking that.",
+    "Perfect… just a moment.",
+    "Right… bear with me a sec."
+  ]);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, filler)}</Play>
+  <Redirect method="POST">${baseUrl}/twilio/next</Redirect>
+</Response>`;
+
+  return res.type("text/xml").send(twiml);
+});
+
+// -------------------- Twilio: main logic step (after filler) --------------------
+app.post("/twilio/next", async (req, res) => {
+  const baseUrl = process.env.PUBLIC_BASE_URL;
+  const callSid = req.body.CallSid || "";
+  const session = ensureSession(callSid);
+
+  if (!session.lead || !session.lead.phone) {
+    const twimlOops = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, "Sorry — I’ve lost the details on my side. I’ll send you a text to book in. Bye for now.")}</Play>
+  <Hangup/>
+</Response>`;
+    return res.type("text/xml").send(twimlOops);
+  }
+
+  const lastUser = [...session.transcript].reverse().find((t) => t.role === "user")?.text || "";
+
+  let reply = "";
+  let shouldHangup = false;
+
+  // OPEN -> CONFIRM_ADDRESS
+  if (session.stage === "OPEN") {
+    if (isNo(lastUser)) {
+      reply = "No problem at all. I’ll send you a quick text and you can pick a time that suits. Bye for now.";
+      shouldHangup = true;
+      session.stage = "DONE";
+    } else {
+      session.stage = "CONFIRM_ADDRESS";
+    }
+  }
+
+  // CONFIRM_ADDRESS
+  if (session.stage === "CONFIRM_ADDRESS") {
+    const hasAddress = !!norm(session.lead.address);
+    const hasPostcode = !!norm(session.lead.postcode);
+
+    if (hasAddress || hasPostcode) {
+      const addrLine = [session.lead.address, session.lead.postcode].filter(Boolean).join(", ");
+
+      if (session.retries.confirmAddress === 0) {
+        reply = `Perfect. I’ve got the survey address as ${addrLine}. Is that correct?`;
+        session.retries.confirmAddress++;
+      } else {
+        if (isYes(lastUser)) {
+          session.booking.confirmed_address = addrLine;
+          session.stage = "ASK_DAY";
+        } else if (isNo(lastUser)) {
+          reply = "No worries — what’s the correct postcode for the survey address?";
+          session.retries.confirmAddress++;
+          session.booking.notes = (session.booking.notes || "") + " Address mismatch reported.";
+        } else {
+          // treat anything that looks like a postcode as a postcode
+          const maybe = lastUser.trim();
+          if (maybe.length >= 5 && /[a-z]/i.test(maybe) && /\d/.test(maybe)) {
+            session.lead.postcode = maybe;
+            session.booking.confirmed_address = [session.lead.address, session.lead.postcode]
+              .filter(Boolean)
+              .join(", ");
+            session.stage = "ASK_DAY";
+          } else {
+            reply = "Sorry — just to confirm, is that address correct?";
+            session.retries.confirmAddress++;
+          }
+        }
+
+        if (session.retries.confirmAddress >= 4 && session.stage === "CONFIRM_ADDRESS") {
+          reply = "No worries — I’ll send you a text to confirm the address and get you booked in. Bye for now.";
+          shouldHangup = true;
+          session.stage = "DONE";
+        }
+      }
+    } else {
+      if (session.retries.confirmAddress === 0) {
+        reply = "Quick one — what’s the postcode for the survey address?";
+        session.retries.confirmAddress++;
+      } else {
+        const maybe = lastUser.trim();
+        if (maybe.length >= 5) {
+          session.lead.postcode = maybe;
+          session.booking.confirmed_address = session.lead.postcode;
+          session.stage = "ASK_DAY";
+        } else {
+          reply = "Sorry — what’s the postcode there?";
+          session.retries.confirmAddress++;
+        }
+      }
+    }
+  }
+
+  // ASK_DAY
+  if (session.stage === "ASK_DAY") {
+    const day = extractDay(lastUser);
+
+    if (!day) {
+      if (session.retries.askDay === 0) {
+        reply = "Lovely. What day suits you best for the survey?";
+        session.retries.askDay++;
+      } else {
+        reply = "No worries — is that more like Monday, Tuesday, or later in the week?";
+        session.retries.askDay++;
+      }
+
+      if (session.retries.askDay >= 4) {
+        reply = "No problem — I’ll text you a link to pick a day that suits. Bye for now.";
+        shouldHangup = true;
+        session.stage = "DONE";
+      }
+    } else {
+      session.booking.preferred_day = day;
+      session.stage = "ASK_WINDOW";
+    }
+  }
+
+  // ASK_WINDOW
+  if (session.stage === "ASK_WINDOW") {
+    const win = extractWindow(lastUser);
+
+    if (!win) {
+      if (session.retries.askWindow === 0) {
+        reply = "Great — would you prefer morning or afternoon?";
+        session.retries.askWindow++;
+      } else {
+        reply = "Just checking — morning or afternoon work better for you?";
+        session.retries.askWindow++;
+      }
+
+      if (session.retries.askWindow >= 4) {
+        reply = "No worries — I’ll text you to choose a time window. Bye for now.";
+        shouldHangup = true;
+        session.stage = "DONE";
+      }
+    } else {
+      session.booking.preferred_window = win;
+
+      // ✅ compute an actual datetime for GHL calendar booking
+      session.booking.start_datetime = computeStartDateTime(
+        session.booking.preferred_day,
+        session.booking.preferred_window
+      );
+
+      session.stage = "CONFIRM_CLOSE";
+    }
+  }
+
+  // CONFIRM_CLOSE -> post to GHL
+  if (session.stage === "CONFIRM_CLOSE") {
+    try {
+      await postToGhlBookingWebhook({
+        lead: session.lead,
+        booking: session.booking,
+        transcript: session.transcript
+      });
+    } catch (e) {
+      console.error("GHL webhook post failed:", e?.message || e);
+    }
+
+    reply = `Perfect. I’ve got ${session.booking.preferred_day} ${session.booking.preferred_window}. I’ll send you a text or email confirmation, and if you need to change it you can just reply. Thanks so much — bye for now.`;
+    shouldHangup = true;
+    session.stage = "DONE";
+  }
+
+  // fallback replies
+  if (!reply && session.stage === "ASK_DAY") reply = "What day suits you best for the survey?";
+  if (!reply && session.stage === "ASK_WINDOW") reply = "Morning or afternoon work better?";
+  if (!reply && session.stage === "CONFIRM_ADDRESS") {
+    const addrLine = [session.lead.address, session.lead.postcode].filter(Boolean).join(", ");
+    reply = `I’ve got the address as ${addrLine}. Is that correct?`;
+  }
+
+  session.transcript.push({ role: "assistant", text: reply });
+  sessions.set(callSid, session);
+
+  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${ttsUrl(baseUrl, reply)}</Play>
+  ${
+    shouldHangup
+      ? "<Hangup/>"
+      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="7"/>`
+  }
+  ${
+    shouldHangup
+      ? ""
+      : `<Play>${ttsUrl(baseUrl, "Sorry — I didn’t catch that. Can you say that one more time?")}</Play>`
+  }
+</Response>`;
+
+  return res.type("text/xml").send(twiml);
+});
+
+// -------------------- ElevenLabs TTS endpoint (Twilio plays this) --------------------
+app.get("/tts", async (req, res) => {
+  try {
+    const text = String(req.query.text || "").trim();
+    if (!text) return res.status(400).send("Missing text");
+
+    if (!process.env.ELEVENLABS_API_KEY || !process.env.ELEVENLABS_VOICE_ID) {
+      return res.status(500).send("Missing ELEVENLABS_API_KEY or ELEVENLABS_VOICE_ID");
+    }
+
+    const safeText = text.slice(0, 600);
+    const voiceId = process.env.ELEVENLABS_VOICE_ID;
+    const url = `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`;
+
+    const r = await fetchFn(url, {
+      method: "POST",
+      headers: {
+        "xi-api-key": process.env.ELEVENLABS_API_KEY,
+        "Content-Type": "application/json",
+        Accept: "audio/mpeg"
+      },
+      body: JSON.stringify({
+        text: safeText,
+        model_id: "eleven_multilingual_v2",
+        voice_settings: { stability: 0.4, similarity_boost: 0.85 }
+      })
+    });
+
+    if (!r.ok) {
+      const errText = await r.text().catch(() => "");
+      console.error("ElevenLabs error:", r.status, errText);
+      return res.status(500).send("TTS failed");
+    }
+
+    const audio = Buffer.from(await r.arrayBuffer());
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.setHeader("Cache-Control", "no-store");
+    return res.status(200).send(audio);
+  } catch (e) {
+    console.error("TTS error:", e);
+    return res.status(500).send("TTS crashed");
+  }
+});
+
+// -------------------- Call status callback --------------------
+app.post("/twilio/status", (req, res) => {
+  const payload = {
+    CallSid: req.body.CallSid,
+    CallStatus: req.body.CallStatus,
+    To: req.body.To,
+    From: req.body.From,
+    Duration: req.body.CallDuration,
+    Timestamp: req.body.Timestamp
+  };
+
+  console.log("Call status:", payload);
+
+  if (payload.CallStatus === "completed") {
+    sessions.delete(payload.CallSid);
+  }
+
+  res.status(200).send("ok");
+});
+
+// -------------------- Post to GHL inbound webhook trigger --------------------
+async function postToGhlBookingWebhook({ lead, booking, transcript }) {
   const url = process.env.GHL_BOOKING_TRIGGER_URL;
   if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
 
@@ -129,8 +670,13 @@ async function postToCalendarBooking({ lead, booking }) {
       preferred_day: booking?.preferred_day || "",
       preferred_window: booking?.preferred_window || "",
       confirmed_address: booking?.confirmed_address || "",
-      notes: booking?.notes || ""
-    }
+      notes: booking?.notes || "",
+      // ✅ THIS is the key for calendar booking in GHL:
+      start_datetime: booking?.start_datetime || ""
+    },
+    transcript: transcript
+      .map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`)
+      .join("\n")
   };
 
   const r = await fetchFn(url, {
@@ -145,84 +691,6 @@ async function postToCalendarBooking({ lead, booking }) {
   }
 }
 
-// Handle incoming Twilio voice requests
-app.post("/twilio/voice", async (req, res) => {
-  const baseUrl = process.env.PUBLIC_BASE_URL;
-  const name = req.query.name || "there";
-  const phone = req.query.phone || "";
-  const email = req.query.email || "";
-  const address = req.query.address || "";
-  const postcode = req.query.postcode || "";
-  const propertyType = req.query.propertyType || "";
-  const isHomeowner = req.query.isHomeowner || "";
-
-  const callSid = req.body.CallSid || req.query.CallSid || "";
-
-  const session = ensureSession(callSid);
-  session.lead = { name, phone, email, address, postcode, propertyType, isHomeowner };
-  session.transcript = [{ role: "assistant", text: "Call started." }];
-  session.turns = 0;
-  session.stage = "OPEN";
-  session.retries = { confirmAddress: 0, askDay: 0, askWindow: 0 };
-  session.booking = { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "" };
-
-  sessions.set(callSid, session);
-
-  const opening = `Hi ${name}. It’s Nicola from Greenbug Energy. You requested a free home energy survey about solar panels — have I caught you at an okay time?`;
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${ttsUrl(baseUrl, opening)}</Play>
-  <Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="6"/>
-  <Play>${ttsUrl(baseUrl, "No worries — I’ll send you a text and you can pick a time that suits. Bye for now.")}</Play>
-  <Hangup/>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
-});
-
-// Handle speech input (gather day and window)
-app.post("/twilio/speech", async (req, res) => {
-  const baseUrl = process.env.PUBLIC_BASE_URL;
-  const callSid = req.body.CallSid;
-  const speech = req.body.SpeechResult || "";
-  const session = ensureSession(callSid);
-
-  if (speech) session.transcript.push({ role: "user", text: speech });
-
-  console.log("Speech result:", speech);
-
-  if (session.turns >= 14) {
-    session.stage = "DONE";
-    sessions.set(callSid, session);
-    const bye = "Thanks for that — I’ll send you a quick text and we can take it from there. Bye for now.";
-    const twimlEnd = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${ttsUrl(baseUrl, bye)}</Play>
-  <Hangup/>
-</Response>`;
-    return res.type("text/xml").send(twimlEnd);
-  }
-
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${ttsUrl(baseUrl, "I didn’t catch that. Can you repeat it?")}</Play>
-  <Redirect method="POST">${baseUrl}/twilio/next</Redirect>
-</Response>`;
-
-  res.type("text/xml").send(twiml);
-});
-
-// The `/twilio/next` can now manage flow as needed for the conversation
-
-// -------------------- Call status callback --------------------
-app.post("/twilio/status", (req, res) => {
-  const payload = req.body;
-  console.log("Call status:", payload);
-  res.status(200).send("ok");
-});
-
+// IMPORTANT: listen on Railway port
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server is listening on port ${PORT}`);
-});
+app.listen(PORT, "0.0.0.0", () => console.log(`Listening on ${PORT}`));
