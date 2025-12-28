@@ -17,6 +17,33 @@ app.use(express.urlencoded({ extended: false }));
  */
 const sessions = new Map();
 
+// -------------------- Helpers --------------------
+function normalizeYesNo(v) {
+  const s = String(v || "").trim().toLowerCase();
+  if (!s) return "";
+  if (["yes", "y", "yeah", "yep", "true", "1"].includes(s)) return "Yes";
+  if (["no", "n", "nope", "false", "0"].includes(s)) return "No";
+  // Sometimes form gives "Yes " or "YES" etc
+  if (s.includes("yes")) return "Yes";
+  if (s.includes("no")) return "No";
+  return String(v || "").trim();
+}
+
+function alreadyHaveHomeowner(lead) {
+  const v = normalizeYesNo(lead?.isHomeowner);
+  return v === "Yes" || v === "No";
+}
+
+function looksLikeHomeownerQuestion(text) {
+  const t = String(text || "").toLowerCase();
+  return (
+    t.includes("homeowner") ||
+    t.includes("home owner") ||
+    t.includes("own the property") ||
+    t.includes("property owner")
+  );
+}
+
 // -------------------- Health --------------------
 app.get("/", (req, res) => res.status(200).send("OK - Greenbug outbound AI is running"));
 app.get("/health", (req, res) => res.status(200).json({ ok: true }));
@@ -71,11 +98,14 @@ app.post("/ghl/lead", async (req, res) => {
       body.contact?.propertyType ||
       "";
 
-    const isHomeowner =
+    // IMPORTANT: normalise homeowner from form
+    const isHomeownerRaw =
       body.isHomeowner ||
       body["Are You The Homeowner"] ||
       body.contact?.isHomeowner ||
       "";
+
+    const isHomeowner = normalizeYesNo(isHomeownerRaw);
 
     if (!phoneRaw) {
       return res.status(400).json({ ok: false, error: "Missing phone in webhook payload" });
@@ -124,7 +154,8 @@ app.post("/ghl/lead", async (req, res) => {
       message: "Call triggered",
       sid: call.sid,
       to,
-      name
+      name,
+      isHomeowner
     });
   } catch (err) {
     console.error("Error in /ghl/lead:", err);
@@ -142,7 +173,7 @@ app.post("/twilio/voice", async (req, res) => {
   const address = (req.query.address || "").toString();
   const postcode = (req.query.postcode || "").toString();
   const propertyType = (req.query.propertyType || "").toString();
-  const isHomeowner = (req.query.isHomeowner || "").toString();
+  const isHomeowner = normalizeYesNo((req.query.isHomeowner || "").toString());
 
   const callSid = req.body.CallSid || req.query.CallSid || "";
 
@@ -193,11 +224,22 @@ app.post("/twilio/speech", async (req, res) => {
     return res.type("text/xml").send(twimlEnd);
   }
 
-  // Get AI reply + intent (BOOK / LATER / NOT_INTERESTED / CONTINUE)
+  // Get AI reply + intent
   const ai = await getAiTurn({
     lead: session.lead,
     transcript: session.transcript
   });
+
+  // HARD STOP: if homeowner is already answered, never ask it again
+  if (alreadyHaveHomeowner(session.lead) && looksLikeHomeownerQuestion(ai.reply)) {
+    const pt = session.lead.propertyType ? ` (${session.lead.propertyType})` : "";
+    ai.reply =
+      session.lead.postcode
+        ? `Perfect — thanks. Just to confirm, is the postcode still ${session.lead.postcode}?`
+        : `Perfect — thanks. What’s the postcode for the property${pt}?`;
+    ai.intent = "CONTINUE";
+    ai.end_state = "CONTINUE";
+  }
 
   session.transcript.push({ role: "assistant", text: ai.reply });
 
@@ -226,7 +268,7 @@ app.post("/twilio/speech", async (req, res) => {
   ${
     shouldHangup
       ? "<Hangup/>"
-      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="3"/>`
+      : `<Gather input="speech" language="en-GB" action="${baseUrl}/twilio/speech" method="POST" speechTimeout="auto" timeout="7"/>`
   }
   ${
     shouldHangup
@@ -315,26 +357,10 @@ async function getAiTurn({ lead, transcript }) {
     return {
       reply: "Sorry — I’m having a little technical hiccup. I’ll send you a text to get you booked in.",
       intent: "LATER",
-      end_state: "LATER_DONE"
+      end_state: "LATER_DONE",
+      booking: {}
     };
   }
-
-  const system = `
-You are "Nicola", a friendly UK caller for Greenbug Energy.
-Context: You are calling a lead who filled a form requesting a FREE home energy survey about solar panels.
-Goal: Have a natural conversation and book a site survey.
-
-Rules:
-- Sound human, warm, short sentences. UK tone. No robotic scripts.
-- Ask ONE question at a time.
-- Confirm the ADDRESS if missing/unclear. If they already gave it, just confirm postcode.
-- If they are busy: offer to book and text details. If not interested: be polite and end.
-- To BOOK: ask for preferred day and whether morning/afternoon. Do NOT promise an exact time. Say you’ll text confirmation.
-- Output MUST be valid JSON only with keys: reply, intent, end_state, booking
-- intent must be one of: CONTINUE, BOOK, LATER, NOT_INTERESTED
-- end_state must be one of: CONTINUE, BOOKED_DONE, LATER_DONE, NOT_INTERESTED
-- booking is an object and may include: preferred_day, preferred_window, notes, confirmed_address
-`;
 
   const leadSummary = {
     name: lead?.name || "",
@@ -343,16 +369,32 @@ Rules:
     address: lead?.address || "",
     postcode: lead?.postcode || "",
     propertyType: lead?.propertyType || "",
-    isHomeowner: lead?.isHomeowner || ""
+    isHomeowner: normalizeYesNo(lead?.isHomeowner || "")
   };
 
+  const system = `
+You are "Nicola", a friendly UK caller for Greenbug Energy.
+Context: You are calling a lead who filled a form requesting a FREE home energy survey about solar panels.
+Goal: Have a natural conversation and book a site survey.
+
+Hard rules:
+- Output MUST be valid JSON only.
+- Ask ONE question at a time.
+- If leadSummary.isHomeowner is "Yes" or "No", DO NOT ask homeowner again. Treat it as already answered.
+- If address is present, do not re-ask address; you may confirm postcode only.
+- Keep replies short, human, warm, UK tone. No robotic scripts.
+- To BOOK: ask for preferred day and whether morning/afternoon. Do NOT promise an exact time. Say you’ll text confirmation.
+
+Return JSON with keys: reply, intent, end_state, booking
+intent must be one of: CONTINUE, BOOK, LATER, NOT_INTERESTED
+end_state must be one of: CONTINUE, BOOKED_DONE, LATER_DONE, NOT_INTERESTED
+booking may include: preferred_day, preferred_window, notes, confirmed_address
+`.trim();
+
   const messages = [
-    { role: "system", content: system.trim() },
-    {
-      role: "user",
-      content: `Lead details from form (may be partial): ${JSON.stringify(leadSummary)}`
-    },
-    ...transcript.slice(-12).map((t) => ({
+    { role: "system", content: system },
+    { role: "user", content: `Lead details from form: ${JSON.stringify(leadSummary)}` },
+    ...transcript.slice(-10).map((t) => ({
       role: t.role === "assistant" ? "assistant" : "user",
       content: t.text
     }))
@@ -366,7 +408,10 @@ Rules:
     },
     body: JSON.stringify({
       model: "gpt-4o-mini",
-      temperature: 0.4,
+      temperature: 0.3,
+      max_tokens: 220,
+      // IMPORTANT: force valid JSON so we don’t fall back into repeating “homeowner?”
+      response_format: { type: "json_object" },
       messages
     })
   });
@@ -374,11 +419,10 @@ Rules:
   const data = await resp.json();
   const raw = data?.choices?.[0]?.message?.content || "";
 
-  // Parse JSON safely
   try {
     const parsed = JSON.parse(raw);
-    // Hard guardrails
     if (!parsed.reply) throw new Error("No reply");
+
     return {
       reply: String(parsed.reply),
       intent: parsed.intent || "CONTINUE",
@@ -386,9 +430,15 @@ Rules:
       booking: parsed.booking || {}
     };
   } catch (e) {
-    // If the model outputs non-JSON, recover with a generic prompt
+    // If JSON fails, DO NOT default to homeowner if already known
+    const fallbackReply = alreadyHaveHomeowner(lead)
+      ? (lead?.postcode
+          ? `Nice one. Just to confirm, is the postcode still ${lead.postcode}?`
+          : "Nice one. What’s the postcode for the property?")
+      : "Perfect — just a quick one: are you the homeowner at the property?";
+
     return {
-      reply: "Perfect — just a quick one: are you the homeowner at the property?",
+      reply: fallbackReply,
       intent: "CONTINUE",
       end_state: "CONTINUE",
       booking: {}
@@ -411,14 +461,16 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
     address: lead?.address || "",
     postcode: lead?.postcode || "",
     propertyType: lead?.propertyType || "",
-    isHomeowner: lead?.isHomeowner || "",
+    isHomeowner: normalizeYesNo(lead?.isHomeowner || ""),
     booking: {
       preferred_day: booking?.preferred_day || "",
       preferred_window: booking?.preferred_window || "",
       confirmed_address: booking?.confirmed_address || "",
       notes: booking?.notes || ""
     },
-    transcript: transcript.map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`).join("\n")
+    transcript: transcript
+      .map((t) => `${t.role === "assistant" ? "Nicola" : "Lead"}: ${t.text}`)
+      .join("\n")
   };
 
   const r = await fetch(url, {
