@@ -1,70 +1,104 @@
-const express = require("express");
-const twilio = require("twilio");
-const axios = require("axios");
+const express = require('express');
+const twilio = require('twilio');
+const axios = require('axios');
 const app = express();
 
-// Middleware to parse incoming requests
-app.use(express.json());
+// GHL often sends JSON; Twilio webhooks are x-www-form-urlencoded
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: false }));
+
+// -------------------- In-memory call sessions (simple + effective) --------------------
+const sessions = new Map();
 
 // Eleven Labs API credentials
 const ELEVEN_LABS_API_KEY = 'your-eleven-labs-api-key'; // Replace with your Eleven Labs API key
 const ELEVEN_LABS_VOICE_ID = 'your-voice-id'; // Replace with the cloned voice ID for Nicola
 
-// Twilio credentials (for creating the call)
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID;
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN;
-const TWILIO_FROM_NUMBER = process.env.TWILIO_FROM_NUMBER;
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL; // Your public URL for the app
+// -------------------- Health --------------------
+app.get('/', (req, res) => res.status(200).send('OK - Greenbug outbound AI is running'));
+app.get('/health', (req, res) => res.status(200).json({ ok: true }));
 
-// Endpoint to trigger outbound call from GHL webhook
-app.post("/ghl/lead", async (req, res) => {
+// -------------------- Trigger outbound call from GHL --------------------
+app.post('/ghl/lead', async (req, res) => {
   try {
-    const { name, phone, email, address, preferred_day, preferred_window, homeowner } = req.body;
-    
-    console.log(`Received lead: ${name}, ${phone}, ${email}, ${address}, Preferred Day: ${preferred_day}, Preferred Window: ${preferred_window}, Homeowner: ${homeowner}`);
+    const body = req.body || {};
+    const phoneRaw = body.phone || body.Phone || body.contact?.phone;
+    const name = body.name || body.contact?.name || "there";
+    const email = body.email || body.contact?.email || "";
+    const address = body.address || body.contact?.address1 || "";
+    const postcode = body.postcode || body.contact?.postalCode || "";
+    const propertyType = body.propertyType || body.contact?.propertyType || "";
+    const isHomeowner = body.isHomeowner || body.contact?.isHomeowner || ""; // Homeowner status
 
-    // Make a call using Twilio if homeowner status is "Yes"
-    const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+    if (!phoneRaw) {
+      return res.status(400).json({ ok: false, error: 'Missing phone in webhook payload' });
+    }
+
+    const to = String(phoneRaw).trim();
+    const from = process.env.TWILIO_FROM_NUMBER;
+
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !from) {
+      return res.status(500).json({
+        ok: false,
+        error: 'Missing TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER env vars',
+      });
+    }
+
+    const baseUrl = process.env.PUBLIC_BASE_URL;
+    if (!baseUrl) {
+      return res.status(500).json({ ok: false, error: 'Missing PUBLIC_BASE_URL env var (your Railway public URL)' });
+    }
+
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+    // Trigger the call – Twilio will hit /twilio/voice for TwiML
     const call = await client.calls.create({
-      to: phone,
-      from: TWILIO_FROM_NUMBER,
-      url: `${PUBLIC_BASE_URL}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(phone)}&homeowner=${encodeURIComponent(homeowner)}&preferred_day=${encodeURIComponent(preferred_day)}&preferred_window=${encodeURIComponent(preferred_window)}`,
-      method: "POST",
-      statusCallback: `${PUBLIC_BASE_URL}/twilio/status`,
-      statusCallbackMethod: "POST",
-      statusCallbackEvent: ["initiated", "ringing", "answered", "completed"]
+      to,
+      from,
+      url: `${baseUrl}/twilio/voice?name=${encodeURIComponent(name)}&phone=${encodeURIComponent(to)}&email=${encodeURIComponent(email)}&address=${encodeURIComponent(address)}&postcode=${encodeURIComponent(postcode)}&propertyType=${encodeURIComponent(propertyType)}&isHomeowner=${encodeURIComponent(isHomeowner)}`,
+      method: 'POST',
+      statusCallback: `${baseUrl}/twilio/status`,
+      statusCallbackMethod: 'POST',
+      statusCallbackEvent: ['initiated', 'ringing', 'answered', 'completed'],
     });
 
-    res.status(200).json({ status: 'success', message: 'Call triggered', sid: call.sid });
-  } catch (error) {
-    console.error('Error in /ghl/lead:', error);
-    res.status(500).json({ error: error.message || 'Error processing lead' });
+    return res.status(200).json({
+      ok: true,
+      message: 'Call triggered',
+      sid: call.sid,
+      to,
+      name,
+    });
+  } catch (err) {
+    console.error('Error in /ghl/lead:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'Unknown error' });
   }
 });
 
-// Endpoint to handle the Twilio call response (Voice Interaction)
-app.post("/twilio/voice", async (req, res) => {
+// -------------------- Twilio: first prompt (TwiML) --------------------
+app.post('/twilio/voice', async (req, res) => {
   try {
+    const baseUrl = process.env.PUBLIC_BASE_URL;
     const { name, phone, homeowner, preferred_day, preferred_window } = req.query;
 
-    let message = `Hi ${name}, it’s Nicola from Greenbug Energy. You requested a callback about your home energy survey.`;
+    // If the homeowner information is already provided, skip asking
+    let openingMessage = `Hi ${name}, it’s Nicola from Greenbug Energy. You requested a callback about your home energy survey.`;
 
-    // If homeowner info is provided, skip the question
-    if (homeowner === "Yes") {
-      message += " Thank you for confirming that you are the homeowner.";
+    // Skip the "Are you the homeowner?" question if it's already answered
+    if (homeowner === 'Yes') {
+      openingMessage += ' Thanks for confirming your homeownership.';
     } else {
-      message += " Can you confirm if you are the homeowner?";
+      openingMessage += ' Can you confirm if you are the homeowner?';
     }
 
-    // Generate voice using Eleven Labs
-    const audioUrl = await sendElevenLabsMessage(message);
+    // Generate voice message using Eleven Labs API
+    const audioUrl = await sendElevenLabsMessage(openingMessage);
 
-    // Create Twilio Voice Response
+    // Create Twilio VoiceResponse
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.play(audioUrl); // Play the generated voice
 
-    // Send response to Twilio
+    // Send the TwiML response
     res.type('text/xml');
     res.send(twiml.toString());
   } catch (error) {
@@ -73,13 +107,13 @@ app.post("/twilio/voice", async (req, res) => {
   }
 });
 
-// Function to call Eleven Labs API to generate voice response
+// -------------------- Send message to Eleven Labs for TTS --------------------
 const sendElevenLabsMessage = async (text) => {
   try {
     const response = await axios.post('https://api.elevenlabs.io/v1/text-to-speech', {
       voice_id: ELEVEN_LABS_VOICE_ID,
       text: text,
-      voice_settings: { speed: 1.0, pitch: 1.0 },
+      voice_settings: { speed: 1.0, pitch: 1.0 }, // Adjust the voice settings if needed
     }, {
       headers: {
         'Authorization': `Bearer ${ELEVEN_LABS_API_KEY}`,
@@ -95,23 +129,32 @@ const sendElevenLabsMessage = async (text) => {
   }
 };
 
-// Endpoint to capture the result of the speech input
-app.post("/twilio/speech", (req, res) => {
+// -------------------- Twilio: handle speech + continue conversation --------------------
+app.post('/twilio/speech', async (req, res) => {
   try {
-    const speech = (req.body.SpeechResult || "").toLowerCase();
-    const confidence = req.body.Confidence;
+    const { CallSid, SpeechResult } = req.body;
+    const speech = (SpeechResult || '').trim();
 
+    const session = sessions.get(CallSid) || { lead: {}, transcript: [], turns: 0 };
+    session.turns = (session.turns || 0) + 1;
+
+    // Add user speech to transcript
+    if (speech) session.transcript.push({ role: 'user', text: speech });
+
+    console.log('Speech:', { CallSid, speech });
+
+    // Simple flow to handle responses like Yes, No, etc.
     let reply = "Sorry, I didn’t catch that. Can you repeat?";
-    if (speech.includes("yes")) {
-      reply = "Thank you! We will proceed with your survey booking.";
-    } else if (speech.includes("no")) {
-      reply = "Alright, let us know when you're ready.";
+    if (speech.includes('yes')) {
+      reply = "Thank you! We'll proceed with the survey.";
+    } else if (speech.includes('no')) {
+      reply = "Alright, let us know when you're ready for the survey.";
     }
 
-    // Respond with the appropriate message
+    // Generate Twilio response
     const twiml = new twilio.twiml.VoiceResponse();
     twiml.say(reply);
-    twiml.hangup();
+    twiml.hangup(); // End the call
 
     res.type('text/xml');
     res.send(twiml.toString());
@@ -121,27 +164,28 @@ app.post("/twilio/speech", (req, res) => {
   }
 });
 
-// Endpoint for status callback (used to track call status)
-app.post("/twilio/status", (req, res) => {
-  try {
-    const payload = {
-      CallSid: req.body.CallSid,
-      CallStatus: req.body.CallStatus,
-      To: req.body.To,
-      From: req.body.From,
-      Duration: req.body.CallDuration,
-      Timestamp: req.body.Timestamp,
-    };
+// -------------------- Call status callback --------------------
+app.post('/twilio/status', (req, res) => {
+  const payload = {
+    CallSid: req.body.CallSid,
+    CallStatus: req.body.CallStatus,
+    To: req.body.To,
+    From: req.body.From,
+    Duration: req.body.CallDuration,
+    Timestamp: req.body.Timestamp,
+  };
 
-    console.log('Call status update:', payload);
-    res.status(200).send('ok');
-  } catch (error) {
-    console.error('Error handling status callback:', error);
-    res.status(500).send('Internal Server Error');
+  console.log('Call status:', payload);
+
+  // Cleanup finished calls
+  if (payload.CallStatus === 'completed') {
+    sessions.delete(payload.CallSid);
   }
+
+  res.status(200).send('ok');
 });
 
-// Health check route to confirm the server is running
+// -------------------- Health Check --------------------
 app.get('/', (req, res) => {
   res.status(200).send('OK - Server is running');
 });
