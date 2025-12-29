@@ -14,7 +14,8 @@ app.use(express.urlencoded({ extended: false }));
  *   turns: number,
  *   stage: "OPEN"|"CONFIRM_ADDRESS"|"ASK_DAY"|"ASK_WINDOW"|"CONFIRM_CLOSE"|"DONE",
  *   retries: { confirmAddress: number, askDay: number, askWindow: number },
- *   booking: { preferred_day, preferred_window, confirmed_address, notes, start_datetime }
+ *   booking: { preferred_day, preferred_window, confirmed_address, notes, start_datetime },
+ *   flags: { bookingPosted: boolean }
  * }
  */
 const sessions = new Map();
@@ -70,7 +71,7 @@ function extractWindow(s) {
   const t = norm(s);
   if (t.includes("morning") || t.includes("am") || t.includes("a.m")) return "Morning";
   if (t.includes("afternoon") || t.includes("pm") || t.includes("p.m")) return "Afternoon";
-  if (t.includes("evening")) return "Evening"; // you said no evening; we won’t offer it, but we can parse it.
+  if (t.includes("evening")) return "Evening"; // we won't offer it, but we can detect it.
   return "";
 }
 
@@ -114,22 +115,30 @@ function ensureSession(callSid) {
       turns: 0,
       stage: "OPEN",
       retries: { confirmAddress: 0, askDay: 0, askWindow: 0 },
-      booking: { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "", start_datetime: "" }
+      booking: {
+        preferred_day: "",
+        preferred_window: "",
+        confirmed_address: "",
+        notes: "",
+        start_datetime: ""
+      },
+      flags: { bookingPosted: false }
     });
   }
   return sessions.get(callSid);
 }
 
-// -------------------- Calendar slot rules (Mon–Fri only, 2 morning + 2 afternoon) --------------------
-// We’ll convert “preferred_day” + “Morning/Afternoon” into a REAL datetime string
-// in a format GHL accepts: "DD-MMM-YYYY HH:MM AM"
+// -------------------- Calendar slot rules (Mon–Fri only, 2 AM slots + 2 PM slots) --------------------
+// Morning slots: 09:00 or 10:30
+// Afternoon slots: 13:00 or 14:30
+// Picks slot based on last digit of phone to spread load.
+// Format for GHL we’re sending: "DD-MMM-YYYY HH:MM AM"
 const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
 
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
 
-// Format: DD-MMM-YYYY HH:MM AM/PM
 function formatGhlDate(d) {
   const dd = pad2(d.getDate());
   const mmm = MONTHS[d.getMonth()];
@@ -149,29 +158,22 @@ function isWeekend(dateObj) {
   return day === 0 || day === 6;
 }
 
-// Choose a deterministic start time (keeps it simple + avoids “random” double-book confusion):
-// Morning => 10:00 AM
-// Afternoon => 2:00 PM
-function windowStartHour(win) {
-  if (win === "Afternoon") return 14;
-  return 10; // Morning default
+function forceWeekday(d) {
+  while (isWeekend(d)) d.setDate(d.getDate() + 1);
+  return d;
 }
 
-// Convert preferred day label into the next matching weekday (Mon–Fri)
 function nextDateForPreferredDay(preferredDay) {
   const now = new Date();
   const d = new Date(now);
   d.setSeconds(0, 0);
 
-  // Tomorrow
   if (preferredDay === "Tomorrow") {
     d.setDate(d.getDate() + 1);
     return d;
   }
 
-  // Next week => next Monday
   if (preferredDay === "Next week") {
-    // move to next Monday, then +7 to guarantee "next week"
     const target = 1; // Monday
     const current = d.getDay();
     let add = (target - current + 7) % 7;
@@ -191,25 +193,34 @@ function nextDateForPreferredDay(preferredDay) {
     return d;
   }
 
-  // fallback: next weekday
   d.setDate(d.getDate() + 1);
   return d;
 }
 
-// Enforce Mon–Fri only. If chosen date lands weekend, push to Monday.
-function forceWeekday(d) {
-  while (isWeekend(d)) d.setDate(d.getDate() + 1);
-  return d;
+function lastDigitSlotIndex(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  const last = digits.length ? parseInt(digits[digits.length - 1], 10) : 0;
+  return Number.isFinite(last) ? (last % 2) : 0; // 0 or 1
 }
 
-function computeStartDateTime(preferredDay, preferredWindow) {
+function slotForWindow(preferredWindow, phone) {
+  const idx = lastDigitSlotIndex(phone); // 0 or 1
+  if (preferredWindow === "Afternoon") {
+    // 13:00 or 14:30
+    return idx === 0 ? { hour: 13, minute: 0 } : { hour: 14, minute: 30 };
+  }
+  // Morning default: 09:00 or 10:30
+  return idx === 0 ? { hour: 9, minute: 0 } : { hour: 10, minute: 30 };
+}
+
+function computeStartDateTime(preferredDay, preferredWindow, phone) {
   let d = nextDateForPreferredDay(String(preferredDay || "").trim());
   d = forceWeekday(d);
 
   const win = String(preferredWindow || "").trim();
-  const hour = windowStartHour(win);
+  const slot = slotForWindow(win, phone);
 
-  d.setHours(hour, 0, 0, 0);
+  d.setHours(slot.hour, slot.minute, 0, 0);
   return formatGhlDate(d);
 }
 
@@ -340,6 +351,7 @@ app.post("/twilio/voice", async (req, res) => {
   session.stage = "OPEN";
   session.retries = { confirmAddress: 0, askDay: 0, askWindow: 0 };
   session.booking = { preferred_day: "", preferred_window: "", confirmed_address: "", notes: "", start_datetime: "" };
+  session.flags = { bookingPosted: false };
 
   sessions.set(callSid, session);
 
@@ -370,7 +382,6 @@ app.post("/twilio/speech", async (req, res) => {
 
   console.log("Speech:", { callSid, speech, confidence, stage: session.stage });
 
-  // Safety stop
   if (session.turns >= 14) {
     session.stage = "DONE";
     sessions.set(callSid, session);
@@ -432,7 +443,7 @@ app.post("/twilio/next", async (req, res) => {
     }
   }
 
-  // CONFIRM_ADDRESS (confirm what we already have, don’t re-ask the whole thing)
+  // CONFIRM_ADDRESS
   if (session.stage === "CONFIRM_ADDRESS") {
     const hasAddress = !!norm(session.lead.address);
     const hasPostcode = !!norm(session.lead.postcode);
@@ -452,7 +463,6 @@ app.post("/twilio/next", async (req, res) => {
           session.retries.confirmAddress++;
           session.booking.notes = (session.booking.notes || "") + " Address mismatch reported.";
         } else {
-          // Treat postcode-like answer as postcode
           const maybe = lastUser.trim();
           if (maybe.length >= 5 && /[a-z]/i.test(maybe) && /\d/.test(maybe)) {
             session.lead.postcode = maybe;
@@ -507,7 +517,6 @@ app.post("/twilio/next", async (req, res) => {
         session.stage = "DONE";
       }
     } else {
-      // If weekend mentioned, re-prompt
       if (day === "Saturday" || day === "Sunday") {
         reply = "We’re Monday to Friday for surveys — which weekday suits best?";
         session.retries.askDay++;
@@ -539,10 +548,11 @@ app.post("/twilio/next", async (req, res) => {
     } else {
       session.booking.preferred_window = win;
 
-      // ✅ GHL needs an actual datetime in accepted format
+      // Real slot time (2 slots AM / 2 slots PM), Mon–Fri
       session.booking.start_datetime = computeStartDateTime(
         session.booking.preferred_day,
-        session.booking.preferred_window
+        session.booking.preferred_window,
+        session.lead.phone
       );
 
       session.stage = "CONFIRM_CLOSE";
@@ -551,14 +561,20 @@ app.post("/twilio/next", async (req, res) => {
 
   // CONFIRM_CLOSE -> post to GHL webhook once and end
   if (session.stage === "CONFIRM_CLOSE") {
-    try {
-      await postToGhlBookingWebhook({
-        lead: session.lead,
-        booking: session.booking,
-        transcript: session.transcript
-      });
-    } catch (e) {
-      console.error("GHL webhook post failed:", e?.message || e);
+    // IMPORTANT: prevent double-posting (stops duplicate bookings / weird repeats)
+    if (!session.flags) session.flags = { bookingPosted: false };
+
+    if (!session.flags.bookingPosted) {
+      try {
+        await postToGhlBookingWebhook({
+          lead: session.lead,
+          booking: session.booking,
+          transcript: session.transcript
+        });
+        session.flags.bookingPosted = true;
+      } catch (e) {
+        console.error("GHL webhook post failed:", e?.message || e);
+      }
     }
 
     reply = `Perfect. I’ve got you down for ${session.booking.preferred_day} ${session.booking.preferred_window}. I’ll send you a text or email confirmation, and if you need to change it you can just reply. Thanks so much — bye for now.`;
@@ -664,7 +680,7 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
   const url = process.env.GHL_BOOKING_TRIGGER_URL;
   if (!url) throw new Error("Missing GHL_BOOKING_TRIGGER_URL env var");
 
-  // ✅ IMPORTANT: wrap in {lead:{...}} so your GHL mappings inboundWebhookRequest.lead.xxx work
+  // Wrap in {lead:{...}} so GHL mappings inboundWebhookRequest.lead.xxx work
   const payload = {
     agent: "Nicola",
     source: "AI_CALL",
@@ -685,7 +701,6 @@ async function postToGhlBookingWebhook({ lead, booking, transcript }) {
       preferred_window: booking?.preferred_window || "",
       confirmed_address: booking?.confirmed_address || "",
       notes: booking?.notes || "",
-      // ✅ what Book Appointment should map to:
       start_datetime: booking?.start_datetime || ""
     },
 
